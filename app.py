@@ -182,6 +182,7 @@ demo = gr.Interface(
     outputs=gr.File(label="Descarga tu presentación (.pptx)"),
     title="Agente de IA: PDF a Diapositivas",
     description="Sube un PDF y el agente generará automáticamente una presentación resumida.",
+    flagging_mode="never",
 )
  
 if __name__ == "__main__":
