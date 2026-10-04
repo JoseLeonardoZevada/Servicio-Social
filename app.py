@@ -7,9 +7,79 @@ import pdfplumber
 import google.generativeai as genai
 from pptx import Presentation
 
-# La API key se lee del "Secret" que configuraste en el Space
+# La API key se lee de la variable de entorno configurada en Render
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-model = genai.GenerativeModel("gemini-2.5-flash")
+
+# "System instruction": el comportamiento y las reglas fijas del agente,
+# separado de la tarea puntual que le pedimos cada vez. Esto es lo más
+# parecido a "entrenar" o "instruir" a un agente basado en un LLM.
+SYSTEM_INSTRUCTION = """
+Eres un asistente experto en diseño de presentaciones. Tu trabajo es leer
+documentos y convertirlos en diapositivas claras, concisas y bien
+estructuradas, pensadas para explicarse en voz alta frente a una audiencia.
+
+Reglas que debes seguir SIEMPRE, sin excepción:
+- Responde ÚNICAMENTE con JSON válido. Nada de texto antes o después,
+  nada de explicaciones, nada de ``` ni marcado de código.
+- Escribe en español neutro, con tono claro y profesional.
+- Cada "title" debe tener máximo 8 palabras.
+- Cada "bullet" debe tener máximo 15 palabras y ser una frase corta,
+  nunca un párrafo completo ni una oración copiada tal cual del documento.
+- No repitas la misma idea en dos diapositivas distintas.
+- La primera diapositiva siempre debe presentar el tema general del
+  documento (a modo de introducción).
+- La última diapositiva siempre debe ser un resumen o conclusión con
+  los puntos más importantes.
+"""
+
+model = genai.GenerativeModel(
+    "gemini-2.5-flash",
+    system_instruction=SYSTEM_INSTRUCTION,
+)
+
+# Ejemplo fijo que le mostramos al modelo (few-shot prompting): le
+# enseña con un caso concreto el patrón exacto que esperamos de entrada
+# y salida, además de las reglas generales de arriba.
+EXAMPLE_INPUT = """
+El reciclaje es el proceso de convertir materiales de desecho en nuevos
+productos. Ayuda a reducir el consumo de materias primas frescas, reduce
+el uso de energía, reduce la contaminación del aire y del agua, y reduce
+las emisiones de gases de efecto invernadero. Los materiales más comunes
+que se reciclan son el papel, el vidrio, el plástico y los metales. Para
+que el reciclaje funcione bien, es importante separar correctamente los
+materiales desde el hogar.
+"""
+
+EXAMPLE_OUTPUT = {
+    "slides": [
+        {
+            "title": "¿Qué es el reciclaje?",
+            "bullets": [
+                "Convierte materiales de desecho en nuevos productos",
+                "Reduce el consumo de materias primas frescas",
+            ],
+        },
+        {
+            "title": "Beneficios ambientales",
+            "bullets": [
+                "Reduce el uso de energía",
+                "Disminuye la contaminación del aire y el agua",
+                "Reduce las emisiones de gases de efecto invernadero",
+            ],
+        },
+        {
+            "title": "Materiales reciclables comunes",
+            "bullets": ["Papel y cartón", "Vidrio", "Plástico", "Metales"],
+        },
+        {
+            "title": "Conclusión",
+            "bullets": [
+                "El reciclaje reduce el impacto ambiental",
+                "La separación correcta desde el hogar es clave",
+            ],
+        },
+    ]
+}
 
 
 def extract_text(pdf_path):
@@ -24,22 +94,29 @@ def extract_text(pdf_path):
 
 
 def ask_gemini_for_slides(text):
-    """Le pide a Gemini que convierta el texto en una estructura de diapositivas (JSON)."""
+    """Le pide a Gemini que convierta el texto en una estructura de diapositivas (JSON).
+
+    Usa few-shot prompting: le mostramos un ejemplo completo de
+    entrada -> salida antes de darle el documento real, además de las
+    reglas fijas que ya tiene en su system_instruction.
+    """
     prompt = f"""
-Eres un asistente que convierte un documento en el contenido de una presentación.
-Lee el siguiente texto y devuelve EXCLUSIVAMENTE un JSON (sin texto adicional,
-sin markdown, sin ``` ), con esta estructura exacta:
+A continuación tienes un ejemplo de cómo debes transformar un texto en
+diapositivas, siguiendo tus reglas:
 
-{{
-  "slides": [
-    {{"title": "Titulo de la diapositiva", "bullets": ["punto 1", "punto 2", "punto 3"]}}
-  ]
-}}
+TEXTO DE EJEMPLO:
+\"\"\"{EXAMPLE_INPUT}\"\"\"
 
-Genera entre 5 y 10 diapositivas que resuman lo mas importante del documento.
-Cada diapositiva debe tener entre 3 y 5 puntos (bullets) cortos y claros.
+SALIDA ESPERADA PARA ESE EJEMPLO:
+{json.dumps(EXAMPLE_OUTPUT, ensure_ascii=False)}
 
-Texto del documento:
+Ahora haz exactamente lo mismo, pero con el siguiente documento real.
+Genera entre 5 y 10 diapositivas, cada una con entre 3 y 5 bullets,
+devolviendo SOLO el JSON con esta estructura exacta:
+
+{{"slides": [{{"title": "...", "bullets": ["...", "..."]}}]}}
+
+DOCUMENTO REAL:
 \"\"\"
 {text[:15000]}
 \"\"\"
