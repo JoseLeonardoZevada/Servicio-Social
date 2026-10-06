@@ -33,7 +33,7 @@ Reglas que debes seguir SIEMPRE, sin excepción:
 """
  
 model = genai.GenerativeModel(
-    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
     system_instruction=SYSTEM_INSTRUCTION,
 )
  
