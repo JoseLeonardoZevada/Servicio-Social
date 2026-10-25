@@ -2,3 +2,5 @@ gradio==5.27.0
 google-generativeai==0.8.3
 pdfplumber==0.11.4
 python-pptx==1.0.2
+requests==2.32.3
+pillow
