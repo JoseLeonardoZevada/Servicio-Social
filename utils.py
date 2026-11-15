@@ -311,14 +311,26 @@ def _problemas_contraste(pal):
 # Wikimedia Commons (imagenes con licencia libre y autor)
 # ==============================================================================
 
+_URL_COMMONS = "https://" + "commons.wikimedia.org/w/api.php"
+
+
 def _licencia_libre(lic):
     return bool(re.match(r"^(cc[\s-]|cc0|public domain|pd[\s-]|pd$|gfdl)", lic.strip().lower()))
+
+
+def _limpiar_url(u):
+    """Limpia si por copiar/pegar una URL quedo envuelta en formato Markdown [url](url)."""
+    u = str(u).strip()
+    m = re.match(r"^\[.*?\]\((https?://[^)]+)\)(.*)$", u)
+    if m:
+        return m.group(1) + m.group(2)
+    return u
 
 
 def buscar_commons(consulta, limite=8):
     """Busca imagenes en Wikimedia Commons y devuelve solo las que traen autor y licencia libre."""
     r = requests.get(
-        "[https://commons.wikimedia.org/w/api.php](https://commons.wikimedia.org/w/api.php)",
+        _limpiar_url(_URL_COMMONS),
         params={
             "action": "query", "generator": "search", "gsrsearch": consulta,
             "gsrnamespace": 6, "gsrlimit": limite, "prop": "imageinfo",
@@ -352,7 +364,7 @@ def buscar_commons(consulta, limite=8):
 
 
 def descargar_imagen(url):
-    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
+    r = requests.get(_limpiar_url(url), headers={"User-Agent": USER_AGENT}, timeout=15)
     r.raise_for_status()
     mime = r.headers.get("Content-Type", "").split(";")[0]
     if mime not in ("image/jpeg", "image/png"):
@@ -366,9 +378,9 @@ def descargar_imagen(url):
 # Ilustraciones generadas con IA (ultimo recurso; Pollinations, gratis y sin clave)
 # ==============================================================================
 
-_URL = "[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/)"
+_URL = "https://" + "image.pollinations.ai/prompt/"
 _ESTILO = ", flat vector illustration, simple composition, clean light background, no text, no letters, no watermark"
-_ESPERA_ENTRE_PETICIONES = 6      # reducido a 6s para no trabar Render
+_ESPERA_ENTRE_PETICIONES = 6
 _ultima = 0.0
 
 
@@ -376,7 +388,7 @@ def generar_imagen_ia(prompt, ancho=800, alto=600, intentos=2):
     """Devuelve (bytes_jpeg, 'image/jpeg'). Con timeout de 30s para evitar cuelgues en Render."""
     global _ultima
     texto = quote((prompt.strip()[:260]) + _ESTILO)
-    url = f"{_URL}{texto}"
+    url = _limpiar_url(f"{_URL}{texto}")
     ultimo_error = None
     for k in range(intentos):
         falta = _ESPERA_ENTRE_PETICIONES - (time.time() - _ultima)
