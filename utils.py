@@ -1,5 +1,5 @@
-"""Utilidades compartidas por todos los agentes: IA (Gemini), JSON y texto, diseño, Wikimedia Commons,
-ilustraciones con IA, funciones de python-pptx, cálculos del plan y motor RAG ligero en memoria."""
+"""Utilidades compartidas por todos los agentes: IA (Gemini), JSON y texto, diseno, Wikimedia Commons,
+ilustraciones con IA, funciones de python-pptx, calculos del plan y motor RAG ligero en memoria."""
 
 import io
 import json
@@ -44,17 +44,19 @@ class ErrorPipeline(Exception):
 # ==============================================================================
 
 def llamar_llm(system_instruction, prompt):
-    """Una llamada a Gemini. 'prompt' puede ser texto o una lista (texto + imágenes).
-    Si Gemini responde que hay demasiadas peticiones o está saturado, espera y reintenta."""
+    """Una llamada a Gemini con timeout de 90s para nunca colgar Render.
+    Si Gemini responde que hay demasiadas peticiones o esta saturado, espera y reintenta."""
     model = genai.GenerativeModel(MODEL_NAME, system_instruction=system_instruction)
-    esperas = (6, 20, 45)
+    esperas = (5, 12, 25)
     for k in range(len(esperas) + 1):
         try:
-            return model.generate_content(prompt).text.strip()
+            resp = model.generate_content(prompt, request_options={"timeout": 90})
+            return (resp.text or "").strip()
         except Exception as e:
             descripcion = f"{type(e).__name__} {e}"
-            pasajero = any(t in descripcion for t in ("429", "503", "ResourceExhausted", "ServiceUnavailable",
-                                                      "TooManyRequests", "DeadlineExceeded"))
+            print(f"[LLM] Aviso en intento {k + 1}: {descripcion[:140]}", flush=True)
+            pasajero = any(t in descripcion for t in ("429", "503", "504", "ResourceExhausted", "ServiceUnavailable",
+                                                      "TooManyRequests", "DeadlineExceeded", "Timeout"))
             if not pasajero or k == len(esperas):
                 raise
             time.sleep(esperas[k])
@@ -72,19 +74,19 @@ def num_palabras(texto):
 
 
 def con_feedback(prompt, feedback):
-    """Si el Jefe rechazó un intento anterior, se lo decimos al agente."""
+    """Si el Jefe rechazo un intento anterior, se lo decimos al agente."""
     if not feedback:
         return prompt
     return (
         prompt
-        + "\n\nIMPORTANTE: el Jefe rechazó tu intento anterior por estos motivos:\n"
+        + "\n\nIMPORTANTE: el Jefe rechazo tu intento anterior por estos motivos:\n"
         + feedback
-        + "\nCorrígelo en este nuevo intento."
+        + "\nCorrigelo en este nuevo intento."
     )
 
 
 def _chk(lista, regla, ok, detalle="", bloquea=True):
-    """Registra una revisión del Jefe. Si 'bloquea' es False, solo avisa (⚠️)."""
+    """Registra una revision del Jefe. Si 'bloquea' es False, solo avisa."""
     lista.append({"regla": regla, "ok": bool(ok), "detalle": "" if ok else (detalle or regla),
                   "bloquea": bloquea})
 
@@ -94,7 +96,7 @@ def _limpiar_html(s):
 
 
 def _recortar_texto(texto, limite=LIMITE_TEXTO_REVISION):
-    """Si el texto pasa del límite, conserva el inicio y el final (ahí suele estar la bibliografía)."""
+    """Si el texto pasa del limite, conserva el inicio y el final (ahi suele estar la bibliografia)."""
     if len(texto) <= limite:
         return texto
     ini = int(limite * 0.77)
@@ -102,7 +104,7 @@ def _recortar_texto(texto, limite=LIMITE_TEXTO_REVISION):
 
 
 def _referencia_en_texto(ref, texto_min):
-    """Guardia anti-invención: casi todas las palabras de la referencia deben estar en el PDF."""
+    """Guardia anti-invencion: casi todas las palabras de la referencia deben estar en el PDF."""
     palabras = re.findall(r"\w{4,}", ref.lower())
     if not palabras:
         return False
@@ -110,16 +112,16 @@ def _referencia_en_texto(ref, texto_min):
 
 
 # ==============================================================================
-# RAG ligero en memoria (por fragmentos y páginas)
+# RAG ligero en memoria (por fragmentos y paginas)
 # ==============================================================================
 
 def _tokens_rag(texto):
-    """Palabras normalizadas de 5+ letras recortadas a su raíz de 6 caracteres."""
+    """Palabras normalizadas de 5+ letras recortadas a su raiz de 6 caracteres."""
     return {w[:6] for w in re.findall(r"[a-záéíóúñü0-9]{5,}", str(texto).lower())}
 
 
 def crear_indice_rag(paginas_texto, texto_completo="", max_chars=900):
-    """Divide el PDF en fragmentos (chunks) con número de página y tokens para búsqueda rápida."""
+    """Divide el PDF en fragmentos (chunks) con numero de pagina y tokens para busqueda rapida."""
     indice = []
     fuentes = [(i, t) for i, t in enumerate(paginas_texto or [], 1) if t and t.strip()]
     if not fuentes and texto_completo:
@@ -161,7 +163,7 @@ def crear_indice_rag(paginas_texto, texto_completo="", max_chars=900):
 
 
 def recuperar_contexto_rag(indice_rag, consulta, top_k=3):
-    """Recupera los 'top_k' fragmentos más relevantes del PDF para un tema y sus puntos."""
+    """Recupera los 'top_k' fragmentos mas relevantes del PDF para un tema y sus puntos."""
     if not indice_rag:
         return []
     q_tokens = _tokens_rag(consulta)
@@ -186,7 +188,7 @@ def recuperar_contexto_rag(indice_rag, consulta, top_k=3):
 
 
 # ==============================================================================
-# Diseño: ¿cabe el texto en su caja? y contraste de colores (con auto-ajuste)
+# Diseno: cabe el texto en su caja y contraste de colores (con auto-ajuste)
 # ==============================================================================
 
 def _altura_in(textos, ancho_in, tam, espacio_pt, sangria_in):
@@ -215,7 +217,7 @@ def _cabe(shape, sangria_in=0.4):
 def _hex_a_rgb(h):
     h = str(h).strip().lstrip("#")
     if not re.fullmatch(r"[0-9a-fA-F]{6}", h):
-        raise ValueError(f"color inválido: {h!r}")
+        raise ValueError(f"color invalido: {h!r}")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
@@ -252,44 +254,38 @@ def _forzar_contraste(color, referencia, minimo, hacia_oscuro):
 
 
 def ajustar_contraste_paleta(pal):
-    """Corrige suavemente los colores de la paleta propuesta por la IA si alguno tiene bajo contraste,
-    conservando su tono y evitando descartar el diseño de la IA."""
+    """Corrige suavemente los colores de la paleta propuesta por la IA si alguno tiene bajo contraste."""
     p = dict(pal)
     blanco = (255, 255, 255)
     ajustes = []
 
-    # 1. Asegurar que fondo y tinte sean claros
     for k in ("fondo", "tinte"):
         if _luminancia(p[k]) < 0.65:
             nuevo = _mezclar_rgb(p[k], blanco, 0.75)
-            ajustes.append(f"{k} aclarado ({_a_hex(p[k])}→{_a_hex(nuevo)})")
+            ajustes.append(f"{k} aclarado ({_a_hex(p[k])}->{_a_hex(nuevo)})")
             p[k] = nuevo
 
-    # 2. Portada oscura (para texto blanco encima >= 4.5)
     if _contraste(blanco, p["portada"]) < 4.5:
         nuevo = _forzar_contraste(p["portada"], blanco, 4.6, hacia_oscuro=True)
-        ajustes.append(f"portada oscurecida ({_a_hex(p['portada'])}→{_a_hex(nuevo)})")
+        ajustes.append(f"portada oscurecida ({_a_hex(p['portada'])}->{_a_hex(nuevo)})")
         p["portada"] = nuevo
 
-    # 3. Acento con contraste suficiente para texto blanco (>= 3.0)
     if _contraste(blanco, p["acento"]) < 3.0:
         nuevo = _forzar_contraste(p["acento"], blanco, 3.1, hacia_oscuro=True)
-        ajustes.append(f"acento ajustado ({_a_hex(p['acento'])}→{_a_hex(nuevo)})")
+        ajustes.append(f"acento ajustado ({_a_hex(p['acento'])}->{_a_hex(nuevo)})")
         p["acento"] = nuevo
 
-    # 4. Acento2 visible sobre portada (>= 3.0)
     if _contraste(p["acento2"], p["portada"]) < 3.0:
         nuevo = _forzar_contraste(p["acento2"], p["portada"], 3.1, hacia_oscuro=False)
-        ajustes.append(f"acento2 aclarado ({_a_hex(p['acento2'])}→{_a_hex(nuevo)})")
+        ajustes.append(f"acento2 aclarado ({_a_hex(p['acento2'])}->{_a_hex(nuevo)})")
         p["acento2"] = nuevo
 
-    # 5. Texto y título legibles sobre fondo y tinte (>= 4.5)
     for k in ("texto", "titulo"):
         for base in ("fondo", "tinte"):
             if _contraste(p[k], p[base]) < 4.5:
                 nuevo = _forzar_contraste(p[k], p[base], 4.6, hacia_oscuro=True)
                 if nuevo != p[k]:
-                    ajustes.append(f"{k} oscurecido sobre {base} ({_a_hex(p[k])}→{_a_hex(nuevo)})")
+                    ajustes.append(f"{k} oscurecido sobre {base} ({_a_hex(p[k])}->{_a_hex(nuevo)})")
                     p[k] = nuevo
 
     return p, ajustes
@@ -312,7 +308,7 @@ def _problemas_contraste(pal):
 
 
 # ==============================================================================
-# Wikimedia Commons (imágenes con licencia libre y autor)
+# Wikimedia Commons (imagenes con licencia libre y autor)
 # ==============================================================================
 
 def _licencia_libre(lic):
@@ -320,7 +316,7 @@ def _licencia_libre(lic):
 
 
 def buscar_commons(consulta, limite=8):
-    """Busca imágenes en Wikimedia Commons y devuelve solo las que traen autor y licencia libre."""
+    """Busca imagenes en Wikimedia Commons y devuelve solo las que traen autor y licencia libre."""
     r = requests.get(
         "[https://commons.wikimedia.org/w/api.php](https://commons.wikimedia.org/w/api.php)",
         params={
@@ -328,7 +324,7 @@ def buscar_commons(consulta, limite=8):
             "gsrnamespace": 6, "gsrlimit": limite, "prop": "imageinfo",
             "iiprop": "url|extmetadata|mime|size", "iiurlwidth": 800, "format": "json",
         },
-        headers={"User-Agent": USER_AGENT}, timeout=20,
+        headers={"User-Agent": USER_AGENT}, timeout=15,
     )
     r.raise_for_status()
     paginas = r.json().get("query", {}).get("pages", {}).values()
@@ -356,7 +352,7 @@ def buscar_commons(consulta, limite=8):
 
 
 def descargar_imagen(url):
-    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=25)
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
     r.raise_for_status()
     mime = r.headers.get("Content-Type", "").split(";")[0]
     if mime not in ("image/jpeg", "image/png"):
@@ -367,19 +363,19 @@ def descargar_imagen(url):
 
 
 # ==============================================================================
-# Ilustraciones generadas con IA (último recurso; Pollinations, gratis y sin clave)
+# Ilustraciones generadas con IA (ultimo recurso; Pollinations, gratis y sin clave)
 # ==============================================================================
 
 _URL = "[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/)"
 _ESTILO = ", flat vector illustration, simple composition, clean light background, no text, no letters, no watermark"
-_ESPERA_ENTRE_PETICIONES = 16     # segundos (el plan anónimo permite ~1 petición cada 15 s)
+_ESPERA_ENTRE_PETICIONES = 6      # reducido a 6s para no trabar Render
 _ultima = 0.0
 
 
-def generar_imagen_ia(prompt, ancho=1024, alto=768, intentos=3):
-    """Devuelve (bytes_jpeg, 'image/jpeg'). Lanza una excepción si no pudo generarla."""
+def generar_imagen_ia(prompt, ancho=800, alto=600, intentos=2):
+    """Devuelve (bytes_jpeg, 'image/jpeg'). Con timeout de 30s para evitar cuelgues en Render."""
     global _ultima
-    texto = quote((prompt.strip()[:300]) + _ESTILO)
+    texto = quote((prompt.strip()[:260]) + _ESTILO)
     url = f"{_URL}{texto}"
     ultimo_error = None
     for k in range(intentos):
@@ -389,7 +385,7 @@ def generar_imagen_ia(prompt, ancho=1024, alto=768, intentos=3):
         _ultima = time.time()
         try:
             r = requests.get(url, params={"width": ancho, "height": alto, "nologo": "true"},
-                             headers={"User-Agent": USER_AGENT}, timeout=120)
+                             headers={"User-Agent": USER_AGENT}, timeout=30)
             if r.status_code in (429, 500, 502, 503, 504):
                 ultimo_error = RuntimeError(f"HTTP {r.status_code}")
                 continue
@@ -399,7 +395,7 @@ def generar_imagen_ia(prompt, ancho=1024, alto=768, intentos=3):
             im = Image.open(io.BytesIO(r.content))
             im.load()
             salida = io.BytesIO()
-            im.convert("RGB").save(salida, "JPEG", quality=90)
+            im.convert("RGB").save(salida, "JPEG", quality=88)
             return salida.getvalue(), "image/jpeg"
         except Exception as e:
             ultimo_error = e
@@ -411,7 +407,7 @@ def generar_imagen_ia(prompt, ancho=1024, alto=768, intentos=3):
 # ==============================================================================
 
 def _sin_vineta(par):
-    """Quita la viñeta y la sangría de un párrafo (para texto corrido)."""
+    """Quita la vineta y la sangria de un parrafo (para texto corrido)."""
     pPr = par._p.get_or_add_pPr()
     pPr.set("marL", "0")
     pPr.set("indent", "0")
@@ -424,7 +420,7 @@ def _rgb(t):
 
 
 def _forma(slide, tipo, x, y, w, h, color, atras=True):
-    """Dibuja una forma de color sin borde ni sombra; opcionalmente detrás del texto."""
+    """Dibuja una forma de color sin borde ni sombra; opcionalmente detras del texto."""
     f = slide.shapes.add_shape(tipo, int(x), int(y), int(w), int(h))
     f.fill.solid()
     f.fill.fore_color.rgb = _rgb(color)
@@ -467,11 +463,11 @@ def _imagenes(slide):
 
 
 # ==============================================================================
-# Plan: temas, diapositivas e imágenes por diapositiva
+# Plan: temas, diapositivas e imagenes por diapositiva
 # ==============================================================================
 
 def rango_de_temas(paginas):
-    """Cuántos temas debe sacar el Recopilador según el tamaño del PDF (20 páginas -> de 6 a 20)."""
+    """Cuantos temas debe sacar el Recopilador segun el tamano del PDF (20 paginas -> de 6 a 20)."""
     minimo = max(3, paginas // 3)
     maximo = min(40, max(8, paginas))
     return minimo, max(minimo, maximo)
@@ -500,36 +496,33 @@ def presupuesto_diapositivas(secciones):
 
 
 def total_objetivo(presupuesto):
-    """Diapositivas de contenido que corresponden: las de los temas + introducción + conclusión."""
+    """Diapositivas de contenido que corresponden: las de los temas + introduccion + conclusion."""
     return sum(f["diapositivas"] for f in presupuesto) + 2
 
 
 def rango_diapositivas(presupuesto):
-    """Límites del veto del Jefe: la IA decide cuántas diapositivas, pero no menos de 70% ni más de 150%
-    de lo que sugiere la fórmula de los caracteres de cada tema."""
+    """Limites del veto del Jefe: la IA decide cuantas diapositivas, pero no menos de 70% ni mas de 150%."""
     obj = total_objetivo(presupuesto)
     return max(3, math.floor(obj * 0.7)), min(MAX_DIAPOSITIVAS, math.ceil(obj * 1.5))
 
 
 def min_imagenes(n):
-    """Mínimo de diapositivas con imagen (60% de las de contenido, redondeado hacia arriba)."""
+    """Minimo de diapositivas con imagen (60% de las de contenido, redondeado hacia arriba)."""
     return math.ceil(round(PROPORCION_IMAGENES * n, 6))
 
 
 def asegurar_imagenes(slides):
-    """Respeta en qué diapositivas decidió la IA poner imagen. Solo interviene si hay 3 o más
+    """Respeta en que diapositivas decidio la IA poner imagen. Solo interviene si hay 3 o mas
     diapositivas seguidas sin imagen o si el total global queda por debajo del 60%."""
     n = len(slides)
     marcas = [str(sl.get("lleva_imagen")).strip().lower() in ("true", "1", "si", "sí") for sl in slides]
     cambios = []
     antes = list(marcas)
 
-    # 1) Evitar bloques largos sin apoyo visual (3 seguidas sin imagen -> marca la de en medio)
     for i in range(2, n):
         if not marcas[i] and not marcas[i - 1] and not marcas[i - 2]:
             marcas[i - 1] = True
 
-    # 2) Cuota mínima global (60%): completar solo si la IA marcó menos del mínimo
     falta = min_imagenes(n) - sum(marcas)
     if falta > 0:
         libres = [i for i, m in enumerate(marcas) if not m]

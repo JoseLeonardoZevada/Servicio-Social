@@ -99,9 +99,10 @@ class Jefe:
             refs = s.get("referencias", [])
             _chk(c, "'referencias' es una lista de máximo 8", isinstance(refs, list) and len(refs) <= 8,
                  "'referencias' debe ser una lista de máximo 8 elementos", bloquea=False)
-            inventadas = [r for r in refs if not _referencia_en_texto(str(r), self.texto_pdf)]
-            _chk(c, "Cada referencia aparece realmente en el texto del PDF", not inventadas,
-                 f"Referencias que no están en el PDF (posiblemente inventadas): {inventadas}")
+            if isinstance(refs, list):
+                inventadas = [r for r in refs if not _referencia_en_texto(str(r), self.texto_pdf)]
+                _chk(c, "Cada referencia aparece realmente en el texto del PDF", not inventadas,
+                     f"Referencias que no están en el PDF (posiblemente inventadas): {inventadas}")
             if all(r["ok"] or not r["bloquea"] for r in c):
                 try:
                     r = self._revision_ia_temas(s)
@@ -445,7 +446,7 @@ class Jefe:
             "diapositiva (su número en 'temas'), salvo la introducción (primera) y la conclusión (última); "
             "'tipo' es parrafo, mixto o bullets; al menos el 60% con 'lleva_imagen' true; usa solo información "
             "del RESUMEN.\n"
-            'Responde {"razonamiento": "...", "slides": [<TODAS corregidas diapositivas las>]}\n\n'
+            'Responde {"razonamiento": "...", "slides": [<TODAS las diapositivas corregidas>]}\n\n'
             "RESUMEN DE TEMAS:\n" + json.dumps(temas, ensure_ascii=False) + "\n\nPLAN ACTUAL:\n"
             + json.dumps(plan, ensure_ascii=False)
         )
@@ -547,6 +548,7 @@ class Jefe:
     def _supervisar(self, agente, entrada, opcional=False, respaldo=None):
         feedback, res = None, None
         for intento in range(1, MAX_INTENTOS + 1):
+            print(f"[JEFE] Ejecutando {agente.nombre} (intento {intento}/{MAX_INTENTOS})...", flush=True)
             t0 = time.time()
             res, revisiones = None, []
             self.ultimo_intento = intento == MAX_INTENTOS
@@ -554,17 +556,21 @@ class Jefe:
                 res = agente.ejecutar(entrada, feedback)
                 revisiones = self.revisar(agente.nombre, res["salida"])
             except Exception as e:
+                print(f"[JEFE] Error en {agente.nombre}: {type(e).__name__}: {e}", flush=True)
                 _chk(revisiones, "La ejecución termina sin errores", False, f"{type(e).__name__}: {e}")
             dt = time.time() - t0
             problemas = [r["detalle"] for r in revisiones if not r["ok"] and r["bloquea"]]
             if not problemas:
+                print(f"[JEFE] {agente.nombre} aprobado en {round(dt, 1)}s", flush=True)
                 self._anotar(agente.nombre, agente.rol, intento, "✅ Aprobado", dt, res, revisiones)
                 return res["salida"]
+            print(f"[JEFE] {agente.nombre} rechazado ({round(dt, 1)}s): {'; '.join(problemas)}", flush=True)
             self._anotar(agente.nombre, agente.rol, intento, "❌ Rechazado por el Jefe", dt, res, revisiones,
                          notas="Motivos: " + "; ".join(problemas))
             feedback = "- " + "\n- ".join(problemas)
 
         if agente.nombre == "Seccionador" and res:
+            print("[JEFE] Corrigiendo el plan directamente...", flush=True)
             salida_ia, por_ia = res["salida"], False
             try:
                 salida_ia, por_ia = self._corregir_plan_ia(res["salida"], feedback), True
@@ -592,6 +598,7 @@ class Jefe:
                 return nuevo
 
         if opcional and respaldo is not None:
+            print(f"[JEFE] Omitiendo paso opcional ({agente.nombre}) tras {MAX_INTENTOS} intentos.", flush=True)
             self._anotar(self.nombre, self.rol, "-", "⚠️ Siguió sin este paso", 0,
                          {"recibio": f"{agente.nombre} falló {MAX_INTENTOS} veces",
                           "entrego": "Presentación sin imágenes",
@@ -600,6 +607,7 @@ class Jefe:
                          notas=feedback or "")
             return respaldo
 
+        print(f"[JEFE] Deteniendo pipeline: {agente.nombre} falló {MAX_INTENTOS} veces.", flush=True)
         self._anotar(self.nombre, self.rol, "-", "🛑 Detuvo el proceso", 0,
                      {"recibio": f"{agente.nombre} falló {MAX_INTENTOS} veces",
                       "razonamiento": "No pude corregirlo yo mismo, así que detengo el proceso para no "
@@ -625,6 +633,7 @@ class Jefe:
                       "detalle": "\n".join(detalle)})
 
     def coordinar(self, pdf_path, ruta_pptx, carpeta):
+        print(f"[JEFE] === Iniciando procesamiento de {os.path.basename(pdf_path)} ===", flush=True)
         lectura = self._supervisar(Lector(carpeta), pdf_path)
         self.texto_original = lectura["texto"]
         self.rango_temas = rango_de_temas(max(1, int(lectura.get("paginas", 1))))
@@ -642,6 +651,7 @@ class Jefe:
         base = self._supervisar(GeneradorPPTX(ruta_pptx), plan)
         final = self._supervisar(Decorador(), base)
         self._revision_final(final["ruta"])
+        print(f"[JEFE] === Presentación completada en {round(time.time() - self.t_inicio, 1)}s ===", flush=True)
         return final["ruta"]
 
     def reporte_html(self, exito):

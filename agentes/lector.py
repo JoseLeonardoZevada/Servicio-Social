@@ -1,5 +1,7 @@
-"""Agente Lector: lee el PDF con Gemini (respaldo: pdfplumber) y saca las imágenes que trae el PDF."""
+"""Agente Lector: extrae texto rapido con pdfplumber (usa Gemini OCR si es escaneado),
+extrae imagenes cuidando los 512 MB de RAM de Render y construye el indice RAG."""
 
+import gc
 import os
 import re
 
@@ -10,9 +12,9 @@ from utils import Agente, crear_indice_rag, llamar_llm, parsear_json
 
 SYS_LECTOR = """
 Eres un transcriptor de documentos. Copias el texto de un PDF de forma fiel, en orden,
-sin resumir, sin corregir y sin inventar nada. Incluye títulos, tablas (como texto) y
-la bibliografía. Si una página es una imagen escaneada, haz OCR. Si hay una figura
-importante, descríbela en una línea entre corchetes: [Figura: ...].
+sin resumir, sin corregir y sin inventar nada. Incluye titulos, tablas (como texto) y
+la bibliografia. Si una pagina es una imagen escaneada, haz OCR. Si hay una figura
+importante, describela en una linea entre corchetes: [Figura: ...].
 Responde solo con el texto transcrito.
 """
 
@@ -26,23 +28,22 @@ def _extraer_plumber(ruta):
 
 
 SYS_LECTOR_IMG = """
-Eres un editor gráfico. Describes imágenes extraídas de un PDF y decides si sirven para ilustrar
-una presentación. Responde ÚNICAMENTE con JSON válido.
+Eres un editor grafico. Describes imagenes extraidas de un PDF y decides si sirven para ilustrar
+una presentacion. Responde UNICAMENTE con JSON valido.
 """
 
 
 def _describir_imagenes(imagenes):
-    """La IA mira las imágenes (de 4 en 4), las describe y descarta logotipos, adornos e imágenes vacías.
-    Si no puede dar su dictamen sobre una imagen, la conserva."""
+    """La IA mira las imagenes (de 4 en 4), las describe y descarta logotipos, adornos e imagenes vacias."""
     utiles, descartadas = [], 0
     for ini in range(0, len(imagenes), 4):
         lote = imagenes[ini:ini + 4]
-        partes = ["Estas imágenes salieron de un PDF. Para cada una devuelve 'descripcion' (una frase en español "
-                  "de qué muestra), 'tipo' (foto, diagrama, grafica, tabla u otro) y 'util' (true si sirve para "
-                  "ilustrar contenido; false si es un logotipo, adorno, fondo, imagen casi vacía o ilegible). "
+        partes = ["Estas imagenes salieron de un PDF. Para cada una devuelve 'descripcion' (una frase en espanol "
+                  "de que muestra), 'tipo' (foto, diagrama, grafica, tabla u otro) y 'util' (true si sirve para "
+                  "ilustrar contenido; false si es un logotipo, adorno, fondo, imagen casi vacia o ilegible). "
                   'Responde {"imagenes": [{"id": "...", "descripcion": "...", "tipo": "...", "util": true}]}']
         for im in lote:
-            partes.append(f"Imagen {im['id']} (página {im['pagina']}):")
+            partes.append(f"Imagen {im['id']} (pagina {im['pagina']}):")
             with open(im["ruta"], "rb") as f:
                 partes.append({"mime_type": "image/jpeg", "data": f.read()})
         try:
@@ -61,12 +62,12 @@ def _describir_imagenes(imagenes):
     return utiles, descartadas
 
 
-MAX_IMAGENES_PDF = 40       # tope de imágenes que se extraen de un PDF
-MAX_IMG_POR_PAGINA = 3      # y por página (las más grandes)
+MAX_IMAGENES_PDF = 16       # reducido para cuidar RAM y llamadas a Gemini en Render Free
+MAX_IMG_POR_PAGINA = 2
 
 
 def _huella(im):
-    """Huella visual de 16x16 para detectar imágenes repetidas (logos, encabezados en cada página)."""
+    """Huella visual de 16x16 para detectar imagenes repetidas (logos, encabezados en cada pagina)."""
     g = im.convert("L").resize((16, 16))
     px = list(g.getdata())
     media = sum(px) / len(px)
@@ -74,8 +75,7 @@ def _huella(im):
 
 
 def _extraer_imagenes_pdf(ruta, carpeta, paginas_texto):
-    """Recorta de cada página las imágenes que trae el PDF (fotos, diagramas) y las guarda en 'carpeta'.
-    Descarta iconos, páginas escaneadas completas, imágenes casi lisas y repetidas."""
+    """Recorta de cada pagina las imagenes que trae el PDF cuidando la memoria RAM de Render (100 DPI)."""
     imagenes, huellas = [], set()
     with pdfplumber.open(ruta) as pdf:
         for num, page in enumerate(pdf.pages, 1):
@@ -88,36 +88,40 @@ def _extraer_imagenes_pdf(ruta, carpeta, paginas_texto):
                 top, bottom = max(im["top"], 0), min(im["bottom"], page.height)
                 w, h = x1 - x0, bottom - top
                 if w < 100 or h < 80:
-                    continue                                   # iconos y viñetas
+                    continue
                 if not 0.03 <= (w * h) / area_pagina <= 0.85:
-                    continue                                   # demasiado pequeña o página escaneada completa
+                    continue
                 if not 0.2 <= w / h <= 5:
-                    continue                                   # franjas o líneas
+                    continue
                 cajas.append((w * h, (x0, top, x1, bottom)))
             for _, caja in sorted(cajas, reverse=True)[:MAX_IMG_POR_PAGINA]:
                 try:
-                    pil = page.crop(caja).to_image(resolution=150).original.convert("RGB")
-                    if pil.width < 250 or pil.height < 150:
+                    pil = page.crop(caja).to_image(resolution=100).original.convert("RGB")
+                    if pil.width < 220 or pil.height < 140:
                         continue
                     if ImageStat.Stat(pil.convert("L")).stddev[0] < 8:
-                        continue                               # imagen casi lisa
+                        continue
                     h16 = _huella(pil)
                     if h16 in huellas:
                         continue
                     huellas.add(h16)
                     n = len(imagenes) + 1
                     ruta_img = os.path.join(carpeta, f"pdf_img_{n}.jpg")
-                    pil.save(ruta_img, "JPEG", quality=88)
+                    pil.save(ruta_img, "JPEG", quality=85)
+                    ancho, alto = pil.width, pil.height
+                    pil.close()
                     imagenes.append({"id": f"pdf-{n}", "ruta": ruta_img, "pagina": num,
-                                     "ancho": pil.width, "alto": pil.height,
-                                     "contexto": (paginas_texto[num - 1] or "")[:3000]})
+                                     "ancho": ancho, "alto": alto,
+                                     "contexto": (paginas_texto[num - 1] or "")[:2000]})
                 except Exception:
                     continue
+            page.flush_cache()
+    gc.collect()
     return imagenes
 
 
 def _solapamiento(a, b):
-    """Fracción de las palabras (5+ letras) de 'a' que también aparecen en 'b'."""
+    """Fraccion de las palabras (5+ letras) de 'a' que tambien aparecen en 'b'."""
     pa = set(re.findall(r"\w{5,}", a.lower()))
     if not pa:
         return 1.0
@@ -127,35 +131,43 @@ def _solapamiento(a, b):
 
 class Lector(Agente):
     nombre = "Lector"
-    rol = "Lee el PDF con Gemini (también escaneados), usa pdfplumber como respaldo e indexa fragmentos para RAG"
+    rol = "Lee el PDF con pdfplumber (o Gemini si viene escaneado), extrae imagenes e indexa fragmentos para RAG"
 
     def __init__(self, carpeta):
         self.carpeta = carpeta
-        self._imagenes = None          # se extraen una sola vez, aunque el Jefe pida reintentar
+        self._imagenes = None
         self._descartadas_ia = 0
 
     def ejecutar(self, entrada, feedback=None):
-        paginas = _extraer_plumber(entrada)                    # respaldo, siempre se calcula
+        print(f"[LECTOR] Extrayendo texto de {os.path.basename(entrada)}...", flush=True)
+        paginas = _extraer_plumber(entrada)
+        t_plumber = "\n\n".join(t for t in paginas if t)
+        vacias = sum(1 for t in paginas if not t or len(t.strip()) < 40)
+
         nota_img = ""
         if self._imagenes is None:
             try:
+                print("[LECTOR] Buscando imagenes dentro del PDF...", flush=True)
                 self._imagenes = _extraer_imagenes_pdf(entrada, self.carpeta, paginas)
                 self._descartadas_ia = 0
                 if self._imagenes:
+                    print(f"[LECTOR] Describiendo {len(self._imagenes)} imagenes con IA...", flush=True)
                     self._imagenes, self._descartadas_ia = _describir_imagenes(self._imagenes)
             except Exception as e:
                 self._imagenes = []
-                nota_img = f"No se pudieron extraer imágenes del PDF ({type(e).__name__}: {e})."
+                nota_img = f"No se pudieron extraer imagenes del PDF ({type(e).__name__}: {e})."
         imagenes = self._imagenes
-        t_plumber = "\n".join(t for t in paginas if t)
-        vacias = sum(1 for t in paginas if not t)
-        fuente, t_ia, nota = "pdfplumber", "", ""
 
-        if feedback:
-            nota = "El Jefe rechazó la lectura anterior, así que usé el respaldo (pdfplumber)."
+        fuente, t_ia, nota = "pdfplumber", "", ""
+        # Si pdfplumber ya extrajo texto solido en la mayoria de las paginas, lo usamos directo sin gastar 2 min en OCR
+        if len(t_plumber.strip()) >= 400 and vacias <= len(paginas) * 0.4 and not feedback:
+            nota = "El PDF tiene texto digital nativo completo; se uso pdfplumber directo e indexacion RAG por pagina."
+        elif feedback:
+            nota = "El Jefe rechazo la lectura anterior, asi que use el respaldo (pdfplumber)."
         else:
             try:
-                if os.path.getsize(entrada) > 15_000_000:
+                print("[LECTOR] PDF escaneado o con poco texto; transcribiendo con Gemini...", flush=True)
+                if os.path.getsize(entrada) > 12_000_000:
                     raise ValueError("el PDF es muy pesado para enviarlo a Gemini")
                 with open(entrada, "rb") as f:
                     datos = f.read()
@@ -163,7 +175,7 @@ class Lector(Agente):
                                                {"mime_type": "application/pdf", "data": datos}])
                 fuente = "Gemini"
             except Exception as e:
-                nota = f"Gemini no pudo leer el PDF ({type(e).__name__}: {e}); usé pdfplumber."
+                nota = f"Gemini no pudo transcribir el PDF ({type(e).__name__}: {e}); use pdfplumber."
 
         texto = t_ia if fuente == "Gemini" else t_plumber
         solap = None
@@ -171,43 +183,41 @@ class Lector(Agente):
             solap = _solapamiento(t_plumber, t_ia)
 
         indice_rag = crear_indice_rag(paginas, texto)
+        print(f"[LECTOR] Listo: {len(paginas)} pags, {len(indice_rag)} chunks RAG, {len(imagenes)} imgs.", flush=True)
 
         lineas = [f"Fuente usada: {fuente}"]
         if nota:
             lineas.append(nota)
         if solap is not None:
             lineas.append(f"Coincidencia de palabras con pdfplumber: {round(solap * 100)}%")
-        lineas.append(f"Índice RAG creado en memoria: {len(indice_rag)} fragmentos por página listos para consulta.")
-        if fuente == "Gemini":
-            lineas.append(f"Inicio de la transcripción: {t_ia[:400].strip()!r}...")
+        lineas.append(f"Indice RAG creado en memoria: {len(indice_rag)} fragmentos por pagina listos para consulta.")
         lineas.append("")
-        lineas.append("Lectura de respaldo (pdfplumber) por página:")
+        lineas.append("Lectura por pagina (pdfplumber):")
         for i, t in enumerate(paginas[:12], 1):
             muestra = t[:200].replace("\n", " ").strip()
-            lineas.append(f"Pág. {i} ({len(t)} caracteres): {muestra}..." if t else f"Pág. {i}: sin texto extraíble")
+            lineas.append(f"Pag. {i} ({len(t)} caracteres): {muestra}..." if t else f"Pag. {i}: sin texto extraible")
         if len(paginas) > 12:
-            lineas.append(f"... y {len(paginas) - 12} páginas más")
+            lineas.append(f"... y {len(paginas) - 12} paginas mas")
         lineas.append("")
         if imagenes:
-            lineas.append(f"Imágenes útiles del PDF ({len(imagenes)}; la IA descartó {self._descartadas_ia} por ser "
-                          "logotipos, adornos o estar vacías), disponibles para el Ilustrador:")
+            lineas.append(f"Imagenes utiles del PDF ({len(imagenes)}; la IA descarto {self._descartadas_ia} por ser "
+                          "logotipos, adornos o estar vacias), disponibles para el Ilustrador:")
             for im in imagenes:
-                lineas.append(f"   {im['id']}: página {im['pagina']}, {im.get('tipo', '?')} — {im.get('descripcion', '')}")
+                lineas.append(f"   {im['id']}: pagina {im['pagina']}, {im.get('tipo', '?')} — {im.get('descripcion', '')}")
         else:
-            lineas.append(nota_img or "El PDF no trae imágenes aprovechables (o son páginas escaneadas).")
+            lineas.append(nota_img or "El PDF no trae imagenes aprovechables (o son paginas escaneadas).")
 
         return {
             "salida": {"texto": texto, "paginas": len(paginas), "fuente": fuente,
                        "texto_plumber": t_plumber, "solapamiento": solap, "imagenes_pdf": imagenes,
                        "indice_rag": indice_rag},
             "recibio": f"PDF: {os.path.basename(entrada)}",
-            "entrego": (f"{len(paginas)} páginas, {len(texto)} caracteres de texto (leído con {fuente}), "
-                        f"{len(indice_rag)} fragmentos RAG y {len(imagenes)} imágenes del PDF"),
+            "entrego": (f"{len(paginas)} paginas, {len(texto)} caracteres de texto (leido con {fuente}), "
+                        f"{len(indice_rag)} fragmentos RAG y {len(imagenes)} imagenes del PDF"),
             "razonamiento": (
-                "Leí el PDF con pdfplumber (respaldo), lo envié a Gemini para transcripción completa "
-                f"y construí un índice RAG de {len(indice_rag)} fragmentos para recuperar información precisa por tema. "
-                + (nota or "Usé la transcripción de Gemini porque coincide con la lectura de pdfplumber.")
+                f"Extraje el texto del PDF ({fuente}) y construi un indice RAG de {len(indice_rag)} fragmentos "
+                "para recuperar informacion precisa por tema. " + nota
             ),
             "detalle": "\n".join(lineas),
-            "notas": f"{vacias} páginas sin texto extraíble para pdfplumber",
+            "notas": f"{vacias} paginas con poco texto",
         }
