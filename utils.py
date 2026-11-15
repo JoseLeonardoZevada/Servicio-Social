@@ -1,4 +1,4 @@
-¿"""Utilidades compartidas por todos los agentes: IA (Gemini), JSON y texto, diseño, Wikimedia Commons,
+"""Utilidades compartidas por todos los agentes: IA (Gemini), JSON y texto, diseño, Wikimedia Commons,
 ilustraciones con IA, funciones de python-pptx, cálculos del plan y motor RAG ligero en memoria."""
 
 import io
