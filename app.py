@@ -1,4 +1,5 @@
-"""Punto de entrada: interfaz Gradio. Los agentes viven en la carpeta agentes/."""
+"""Punto de entrada: interfaz Gradio con soporte de seguridad en el manejo de errores."""
+
 import json
 import os
 import tempfile
@@ -16,12 +17,16 @@ def process_pdf(pdf_file):
     carpeta = tempfile.mkdtemp()
     ruta_pptx = os.path.join(carpeta, "presentacion_generada.pptx")
     ruta_log = os.path.join(carpeta, "bitacora.json")
-
     jefe = Jefe()
+
     try:
         jefe.coordinar(pdf_file, ruta_pptx, carpeta)
         exito = True
     except ErrorPipeline:
+        exito = False
+    except Exception as e:
+        jefe._anotar("Sistema", "Control de errores y seguridad", "-", "🛑 Error bloqueado", 0,
+                     {"recibio": str(pdf_file), "razonamiento": f"{type(e).__name__}: {e}"})
         exito = False
 
     with open(ruta_log, "w", encoding="utf-8") as f:
@@ -49,5 +54,5 @@ demo = gr.Interface(
 )
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port)

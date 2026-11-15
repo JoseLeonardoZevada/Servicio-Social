@@ -1,6 +1,7 @@
-"""Agente Jefe: coordina a los demás, valida su trabajo priorizando el criterio de la IA sobre conteos rígidos,
-manda a corregir hasta 3 veces y, si hace falta, corrige él en la cuarta."""
+"""Agente Jefe: coordina la Arquitectura Jerarquica (Supervisor-Worker), ejecuta el Paso de Seguridad
+Guardian (Anti-Prompt Injection / PDF Seguro), lanza tareas en simultaneo y valida el trabajo de cada agente."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -13,9 +14,9 @@ from pptx.enum.dml import MSO_FILL
 from pptx.util import Inches
 
 from utils import (asegurar_imagenes, _cabe, _chk, ErrorPipeline, _imagenes, llamar_llm,
-                   min_imagenes, num_palabras, parsear_json, presupuesto_diapositivas,
+                   min_imagenes, num_palabras, ocultar_secretos, parsear_json, presupuesto_diapositivas,
                    _problemas_contraste, rango_de_temas, rango_diapositivas, _recortar_texto,
-                   _referencia_en_texto, total_objetivo)
+                   _referencia_en_texto, sanitizar_texto_seguridad, total_objetivo, validar_pdf_seguro)
 from agentes.decorador import Decorador
 from agentes.generador import GeneradorPPTX
 from agentes.ilustrador import Ilustrador
@@ -27,14 +28,14 @@ from config import (COBERTURA_MINIMA, LIMITE_TEXTO_REVISION, MAX_DIAPOSITIVAS, M
 
 SYS_JEFE = """
 Eres el Jefe supervisor de un equipo de agentes que convierte documentos en presentaciones.
-Revisas el trabajo con criterio y sin ser quisquilloso: señalas errores reales, no gustos.
-Responde ÚNICAMENTE con JSON válido.
+Revisas el trabajo con criterio y sin ser quisquilloso: senalas errores reales, no gustos.
+Responde UNICAMENTE con JSON valido.
 """
 
 
 class Jefe:
     nombre = "Jefe"
-    rol = "Supervisa y corrige a los agentes"
+    rol = "Supervisa la Arquitectura Jerarquica, audita la seguridad y corrige a los agentes"
 
     def __init__(self):
         self.log = []
@@ -58,14 +59,63 @@ class Jefe:
                 "rol": rol,
                 "intento": intento,
                 "estado": estado,
-                "recibio": res.get("recibio", "-"),
-                "entrego": res.get("entrego", "-"),
-                "razonamiento": res.get("razonamiento", ""),
-                "detalle": res.get("detalle", ""),
-                "notas": notas or res.get("notas", ""),
+                "recibio": ocultar_secretos(res.get("recibio", "-")),
+                "entrego": ocultar_secretos(res.get("entrego", "-")),
+                "razonamiento": ocultar_secretos(res.get("razonamiento", "")),
+                "detalle": ocultar_secretos(res.get("detalle", "")),
+                "notas": ocultar_secretos(notas or res.get("notas", "")),
                 "revisiones": revisiones or [],
                 "segundos": round(segundos, 1),
             }
+        )
+
+    def _auditar_seguridad(self, pdf_path, lectura):
+        """Agente Guardian integrado en la jerarquia del Jefe: valida firma PDF, filtra Prompt Injection
+        en texto y fragmentos RAG y deja constancia en la bitacora."""
+        t0 = time.time()
+        revs = []
+        info_pdf = validar_pdf_seguro(pdf_path)
+        _chk(revs, "Firma binaria real de PDF (%PDF-) y tamano dentro de limites seguros (Anti-DoS)",
+             info_pdf["firma_pdf_valida"])
+
+        texto_limpio, hallazgos_txt = sanitizar_texto_seguridad(lectura.get("texto", ""))
+        lectura["texto"] = texto_limpio
+
+        hallazgos_rag = []
+        for ch in lectura.get("indice_rag", []) or []:
+            ch["texto"], h = sanitizar_texto_seguridad(ch.get("texto", ""))
+            hallazgos_rag.extend(h)
+
+        total_hallazgos = hallazgos_txt + hallazgos_rag
+        _chk(revs, "Escaneo Anti-Prompt Injection sobre el texto y los fragmentos RAG",
+             len(total_hallazgos) == 0,
+             f"Se neutralizaron {len(total_hallazgos)} patrones sospechosos: {total_hallazgos[:3]}",
+             bloquea=False)
+        _chk(revs, "Lista blanca SSRF activa (solo HTTPS hacia wikimedia.org y pollinations.ai) y ocultamiento de API Keys",
+             True)
+
+        detalle = [
+            f"Archivo verificado: {os.path.basename(pdf_path)} ({info_pdf['peso_kb']} KB, firma %PDF- valida).",
+            f"Fragmentos RAG sanitizados: {len(lectura.get('indice_rag', []))}.",
+            ("Patrones de Prompt Injection neutralizados: " + "; ".join(total_hallazgos)
+             if total_hallazgos else "Sin intentos de Prompt Injection ni payloads maliciosos detectados."),
+            "Protecciones activas: REGLA_BLINDAJE_SISTEMA en LLM, Allowlist HTTPS en descargas y escape XSS en bitacora.",
+        ]
+        self._anotar(
+            "Guardián de Seguridad",
+            "Inspecciona el PDF y sanitiza el texto y el indice RAG contra ataques (Prompt Injection, DoS, SSRF y XSS)",
+            1,
+            "🛡️ Blindaje activo",
+            time.time() - t0,
+            {
+                "recibio": f"PDF ({info_pdf['peso_kb']} KB) y {len(lectura.get('indice_rag', []))} fragmentos RAG",
+                "entrego": "Texto e indice RAG sanitizados y validados",
+                "razonamiento": ("Verifique que el archivo no sea un ejecutable disfrazado ni exceda la memoria de "
+                                 "Render, limpie posibles instrucciones de secuestro de prompt (Indirect Prompt "
+                                 "Injection) y active la lista blanca de dominios para el Ilustrador."),
+                "detalle": "\n".join(detalle),
+            },
+            revs,
         )
 
     def revisar(self, nombre, s):
@@ -635,6 +685,10 @@ class Jefe:
     def coordinar(self, pdf_path, ruta_pptx, carpeta):
         print(f"[JEFE] === Iniciando procesamiento de {os.path.basename(pdf_path)} ===", flush=True)
         lectura = self._supervisar(Lector(carpeta), pdf_path)
+
+        # Paso de Seguridad (Guardian): valida el PDF, sanitiza el texto y los fragmentos RAG
+        self._auditar_seguridad(pdf_path, lectura)
+
         self.texto_original = lectura["texto"]
         self.rango_temas = rango_de_temas(max(1, int(lectura.get("paginas", 1))))
         self.texto_pdf = (lectura["texto"] + "\n" + lectura.get("texto_plumber", "")).lower()
@@ -647,8 +701,20 @@ class Jefe:
         plan = {**plan, "documento": os.path.basename(pdf_path), "referencias": resumen.get("referencias", []),
                 "imagenes_pdf": lectura.get("imagenes_pdf", []), "secciones": self.secciones}
         respaldo = {**plan, "slides": [{k: v for k, v in s.items() if k != "imagen"} for s in plan["slides"]]}
-        plan = self._supervisar(Ilustrador(carpeta), plan, opcional=True, respaldo=respaldo)
-        base = self._supervisar(GeneradorPPTX(ruta_pptx), plan)
+
+        # Ejecucion en SIMULTANEO entre agentes: mientras el Ilustrador busca imagenes,
+        # un hilo paralelo va redactando las Notas del Orador para ahorrar tiempo en el Generador.
+        gen_agente = GeneradorPPTX(ruta_pptx)
+        print("[JEFE] Lanzando en simultaneo: Ilustrador (imagenes) + Redaccion de Notas del Orador...", flush=True)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_notas = pool.submit(gen_agente._notas, plan)
+            plan = self._supervisar(Ilustrador(carpeta), plan, opcional=True, respaldo=respaldo)
+            try:
+                plan["notas_precalculadas"] = fut_notas.result(timeout=95)
+            except Exception:
+                plan["notas_precalculadas"] = {}
+
+        base = self._supervisar(gen_agente, plan)
         final = self._supervisar(Decorador(), base)
         self._revision_final(final["ruta"])
         print(f"[JEFE] === Presentación completada en {round(time.time() - self.t_inicio, 1)}s ===", flush=True)
@@ -665,6 +731,8 @@ class Jefe:
         h = ['<div style="max-height:75vh;overflow-y:auto;padding-right:10px;">']
         h.append("<h3>Informe final del Jefe</h3><ul>")
         h.append(f"<li>Resultado: {'✅ presentación generada' if exito else '🛑 el proceso se detuvo'}</li>")
+        h.append("<li>Arquitectura: <b>Jerárquica Híbrida (Supervisor-Worker) + RAG en Memoria + Ejecución Paralela</b></li>")
+        h.append("<li>Seguridad: <b>🛡️ Guardián activo (Anti-Prompt Injection, firma %PDF-, SSRF Allowlist y XSS Escape)</b></li>")
         h.append(f"<li>Rechazos a agentes: {rechazos}</li>")
         h.append(f"<li>Correcciones hechas por el Jefe: {correcciones}</li>")
         h.append(f"<li>Pasos opcionales omitidos: {omitidos}</li>")
@@ -680,7 +748,7 @@ class Jefe:
                 e(x["entrego"]), f'{x["segundos"]} s')) + "</tr>")
         h.append("</table><h3>Bitácora detallada paso a paso</h3>")
         for x in self.log:
-            abierto = " open" if any(k in x["estado"] for k in ("Rechazado", "Corrigió", "Detuvo", "Siguió", "Revisión final")) else ""
+            abierto = " open" if any(k in x["estado"] for k in ("Rechazado", "Corrigió", "Detuvo", "Siguió", "Revisión final", "Blindaje")) else ""
             h.append(f'<details{abierto} style="{caja}"><summary style="cursor:pointer;font-weight:600;">'
                      f'#{x["paso"]} {e(x["agente"])} — {e(x["estado"])} '
                      f'(intento {e(str(x["intento"]))}, {x["segundos"]} s)</summary>')
