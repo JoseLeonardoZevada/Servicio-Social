@@ -1,4 +1,5 @@
-"""Agente Decorador: la IA propone el diseño y el código lo aplica y lo acomoda."""
+"""Agente Decorador: la IA propone el diseño y el código lo aplica, auto-ajustando el contraste si hace falta."""
+
 import json
 
 from pptx import Presentation
@@ -6,18 +7,20 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.util import Pt, Inches
 
-from utils import (_a_hex, Agente, _colocar, con_feedback, _estilo, _forma, _hex_a_rgb, _imagenes,
-                   llamar_llm, _mejor_tam, parsear_json, _problemas_contraste, _rgb, _sin_vineta)
+from utils import (_a_hex, Agente, ajustar_contraste_paleta, _colocar, con_feedback, _estilo, _forma,
+                   _hex_a_rgb, _imagenes, llamar_llm, _mejor_tam, parsear_json, _problemas_contraste,
+                   _rgb, _sin_vineta)
 from config import TITULO_FUENTES
 
 
-PALETAS = {  # diseños de respaldo y ejemplo de referencia para la IA
+PALETAS = {
     "oceano": {"portada": (0x0B, 0x3C, 0x5D), "fondo": (0xF7, 0xFA, 0xFC), "titulo": (0x0B, 0x3C, 0x5D),
                "texto": (0x2B, 0x35, 0x40), "acento": (0x32, 0x82, 0xB8), "acento2": (0x7F, 0xC4, 0xE8),
                "tinte": (0xDC, 0xEC, 0xF6)},
 }
 BLANCO = (0xFF, 0xFF, 0xFF)
 ENCABEZADOS_FUENTES = ("Fuentes de información", "Créditos de imágenes")
+
 CLAVES_COLOR = ("portada", "fondo", "titulo", "texto", "acento", "acento2", "tinte")
 ESTILOS_FORMAS = ("circulos", "bloques", "minimal")
 BARRAS = ("izquierda", "superior")
@@ -36,27 +39,32 @@ del documento. Responde ÚNICAMENTE con JSON válido.
 
 
 def _validar_diseno(d):
-    """Valida la propuesta de la IA. Devuelve (diseno, problemas)."""
+    if not isinstance(d, dict):
+        return None, ["la respuesta no es un objeto JSON"]
     prob, pal = [], {}
-    paleta = d.get("paleta") if isinstance(d.get("paleta"), dict) else {}
+    raw_pal = d.get("paleta") if isinstance(d.get("paleta"), dict) else {}
     for k in CLAVES_COLOR:
         try:
-            pal[k] = _hex_a_rgb(paleta.get(k, ""))
+            pal[k] = _hex_a_rgb(raw_pal.get(k, ""))
         except Exception:
-            prob.append(f"color '{k}' inválido o ausente (usa #RRGGBB)")
-    estilo, barra = d.get("estilo_formas"), d.get("barra")
-    ft, fc = d.get("fuente_titulo"), d.get("fuente_cuerpo")
-    if estilo not in ESTILOS_FORMAS:
-        prob.append(f"'estilo_formas' debe ser uno de {list(ESTILOS_FORMAS)}")
-    if barra not in BARRAS:
-        prob.append(f"'barra' debe ser uno de {list(BARRAS)}")
-    if ft not in FUENTES_OK or fc not in FUENTES_OK:
-        prob.append(f"las fuentes deben ser de {list(FUENTES_OK)}")
+            prob.append(f"color '{k}' inválido o ausente")
+    estilo = d.get("estilo_formas") if d.get("estilo_formas") in ESTILOS_FORMAS else "circulos"
+    barra = d.get("barra") if d.get("barra") in BARRAS else "izquierda"
+    ft = d.get("fuente_titulo") if d.get("fuente_titulo") in FUENTES_OK else "Calibri"
+    fc = d.get("fuente_cuerpo") if d.get("fuente_cuerpo") in FUENTES_OK else "Calibri"
+
+    ajustes = []
     if not prob:
+        pal, ajustes = ajustar_contraste_paleta(pal)
         prob += _problemas_contraste(pal)
+
+    motivo = str(d.get("motivo", ""))
+    if ajustes:
+        motivo = f"{motivo} (auto-ajuste de contraste: {', '.join(ajustes)})".strip()
+
     diseno = {"paleta": pal, "estilo_formas": estilo, "barra": barra,
-              "alternar_fondos": bool(d.get("alternar_fondos")), "fuente_titulo": ft,
-              "fuente_cuerpo": fc, "motivo": str(d.get("motivo", ""))}
+              "alternar_fondos": bool(d.get("alternar_fondos", True)), "fuente_titulo": ft,
+              "fuente_cuerpo": fc, "motivo": motivo, "ajustes_contraste": ajustes}
     return diseno, prob
 
 
@@ -67,16 +75,15 @@ para que la presentación tenga ritmo y se lea bien. Responde ÚNICAMENTE con JS
 
 DISTRIBUCIONES = ("imagen_derecha", "imagen_izquierda", "imagen_grande_derecha", "imagen_grande_izquierda")
 FONDOS = ("claro", "tinte")
-MAX_PALABRAS_IMAGEN_GRANDE = 60
+MAX_PALABRAS_IMAGEN_GRANDE = 65
 
 
 class Decorador(Agente):
     nombre = "Decorador"
-    rol = "La IA propone el diseño (colores, formas, tipografía) y el código lo aplica y lo acomoda"
+    rol = "La IA propone el diseño (colores, formas, tipografía) y el código lo aplica auto-ajustando el contraste"
 
     def _proponer_layouts(self, prs, feedback):
-        """La IA elige para cada diapositiva de contenido el lado y el tamaño de la imagen y el fondo. El código
-        veta lo que no cabe (imagen grande con mucho texto) y usa la distribución por defecto si la IA falla."""
+        """La IA elige para cada diapositiva de contenido el lado y el tamaño de la imagen y el fondo."""
         info, palabras = [], {}
         for i, sl in enumerate(prs.slides):
             if i == 0 or sl.shapes.title.text.startswith(TITULO_FUENTES):
@@ -90,7 +97,7 @@ class Decorador(Agente):
         prompt = (
             "Decide la distribución de cada diapositiva de contenido. Para las que tienen imagen elige "
             f"'distribucion' entre {list(DISTRIBUCIONES)}: alterna los lados para dar ritmo; usa las 'grande' cuando "
-            "el texto es corto (hasta unas 45 palabras) o la imagen es muy visual, porque dejan menos espacio al "
+            "el texto es corto (hasta unas 50 palabras) o la imagen es muy visual, porque dejan menos espacio al "
             "texto. Para todas elige 'fondo' ('claro' o 'tinte') alternando para dar ritmo visual.\n"
             'Responde {"razonamiento": "<criterio>", "diapositivas": [{"diapositiva": N, "distribucion": "...", '
             '"fondo": "claro|tinte"}]}\n\nDIAPOSITIVAS:\n' + json.dumps(info, ensure_ascii=False)
@@ -115,7 +122,7 @@ class Decorador(Agente):
     def ejecutar(self, entrada, feedback=None):
         ruta, tema = entrada["ruta"], entrada["tema"]
         ejemplo = {"paleta": {k: _a_hex(v) for k, v in PALETAS["oceano"].items()},
-                   "estilo_formas": "circulos", "barra": "izquierda", "alternar_fondos": False,
+                   "estilo_formas": "circulos", "barra": "izquierda", "alternar_fondos": True,
                    "fuente_titulo": "Calibri", "fuente_cuerpo": "Calibri", "motivo": "una frase corta"}
         prompt = (
             f"Tema del documento: {tema}\nTítulo: {entrada.get('titulo', '')}\n"
@@ -138,7 +145,7 @@ class Decorador(Agente):
             diseno, problemas = _validar_diseno(propuesta)
         except Exception as e:
             diseno, problemas = None, [f"{type(e).__name__}: {e}"]
-        if problemas:
+        if problemas or not diseno:
             origen = "respaldo"
             motivo = ("La propuesta de la IA se descartó (" + "; ".join(problemas)
                       + "); usé el diseño de respaldo 'oceano'.")
@@ -157,7 +164,8 @@ class Decorador(Agente):
                 self._portada(slide, diseno, W, H)
             else:
                 lay = layouts.get(i, {})
-                tam = self._contenido(slide, diseno, W, H, i, es_fuentes=slide.shapes.title.text.startswith(TITULO_FUENTES),
+                tam = self._contenido(slide, diseno, W, H, i,
+                                      es_fuentes=slide.shapes.title.text.startswith(TITULO_FUENTES),
                                       layout=lay)
                 extra = f" (con imagen: {lay.get('distribucion', 'imagen_derecha')})" if _imagenes(slide) else ""
                 tamanos.append(f"Diap. {i + 1}: texto a {tam} pt{extra}, fondo {lay.get('fondo') or 'automático'}")
@@ -168,12 +176,9 @@ class Decorador(Agente):
             f"Origen del diseño: {origen}\n"
             "Paleta: " + ", ".join(f"{k} {_a_hex(v)}" for k, v in pal.items()) + "\n"
             f"Formas: {diseno['estilo_formas']} · Barra: {diseno['barra']} · "
-            f"Fondos alternados: {'sí' if diseno['alternar_fondos'] else 'no'}\n"
-            f"Tipografía: títulos {diseno['fuente_titulo']}, cuerpo {diseno['fuente_cuerpo']}\n"
-            f"Distribución por diapositiva decidida por: {origen_layout}. {razon_layout}\n"
-            + ("Vetos del código: " + "; ".join(vetos_layout) + "\n" if vetos_layout else "")
-            + "Las imágenes llevan marco de color y su crédito debajo; el tamaño de letra se ajusta para que el "
-            "texto quepa; las diapositivas de fuentes usan letra pequeña.\n"
+            f"Tipografía: {diseno['fuente_titulo']} / {diseno['fuente_cuerpo']}\n"
+            f"Distribución ({origen_layout}): {razon_layout}\n"
+            + (f"Vetos de layout: {', '.join(vetos_layout)}\n" if vetos_layout else "")
             + "\n".join(tamanos)
         )
         return {
@@ -198,12 +203,10 @@ class Decorador(Agente):
         else:
             _forma(slide, MSO_SHAPE.RECTANGLE, 0, H - Inches(0.5), W, Inches(0.5), p["acento"])
         _forma(slide, MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(4.3), Inches(1.6), Inches(0.1), p["acento2"])
-
         titulo = slide.shapes.title
         _colocar(titulo, Inches(0.9), Inches(1.6), Inches(7.4), Inches(2.6))
         tam_t = _mejor_tam([titulo.text], titulo.width, titulo.height, [44, 40, 36, 32], 0, 0)
         _estilo(titulo, tam_t, BLANCO, negrita=True, anclaje=MSO_ANCHOR.BOTTOM, fuente=d["fuente_titulo"])
-
         sub = slide.placeholders[1]
         _colocar(sub, Inches(0.9), Inches(4.6), Inches(7.4), Inches(1.6))
         _estilo(sub, 22, p["acento2"], anclaje=MSO_ANCHOR.TOP, fuente=d["fuente_cuerpo"])
@@ -220,26 +223,24 @@ class Decorador(Agente):
         fondo = p["tinte"] if alterna else p["fondo"]
         color_forma = p["fondo"] if alterna else p["tinte"]
         slide.background.fill.fore_color.rgb = _rgb(fondo)
-
         if estilo == "circulos":
             _forma(slide, MSO_SHAPE.OVAL, W - Inches(2.6), -Inches(1.6), Inches(4.0), Inches(4.0), color_forma)
         elif estilo == "bloques":
-            _forma(slide, MSO_SHAPE.RECTANGLE, W - Inches(2.4), 0, Inches(2.4), Inches(1.2), color_forma)
-        if d["barra"] == "izquierda":
-            _forma(slide, MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.3), H, p["acento"])
+            _forma(slide, MSO_SHAPE.RECTANGLE, W - Inches(1.8), 0, Inches(1.8), Inches(1.8), color_forma)
+        if d["barra"] == "superior":
+            _forma(slide, MSO_SHAPE.RECTANGLE, 0, 0, W, Inches(0.18), p["acento"])
         else:
-            _forma(slide, MSO_SHAPE.RECTANGLE, 0, 0, W, Inches(0.25), p["acento"])
-        _forma(slide, MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(1.7), Inches(1.4), Inches(0.08), p["acento"])
+            _forma(slide, MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.22), H, p["acento"])
+        _forma(slide, MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(1.55), Inches(1.1), Inches(0.07), p["acento2"])
 
         titulo = slide.shapes.title
-        _colocar(titulo, Inches(0.9), Inches(0.45), W - Inches(3.0), Inches(1.2))
+        _colocar(titulo, Inches(0.9), Inches(0.4), W - Inches(1.8), Inches(1.1))
         tam_t = _mejor_tam([titulo.text], titulo.width, titulo.height, [34, 30, 28, 24], 0, 0)
         _estilo(titulo, tam_t, p["titulo"], negrita=True, fuente=d["fuente_titulo"])
 
         cuerpo = slide.placeholders[1]
         pics = _imagenes(slide)
         top_cuerpo, alto_cuerpo = Inches(2.0), H - Inches(3.0)
-
         if pics and not es_fuentes:
             pic = pics[0]
             dist = (layout or {}).get("distribucion", "imagen_derecha")
@@ -264,31 +265,24 @@ class Decorador(Agente):
             else:
                 cuerpo_x = Inches(0.9)
                 ancho_cuerpo = img_x - Inches(0.9) - Inches(0.4)
+            _colocar(cuerpo, cuerpo_x, top_cuerpo, ancho_cuerpo, alto_cuerpo)
         else:
-            cuerpo_x, ancho_cuerpo = Inches(0.9), W - Inches(1.8)
-        _colocar(cuerpo, cuerpo_x, top_cuerpo, ancho_cuerpo, alto_cuerpo)
+            _colocar(cuerpo, Inches(0.9), top_cuerpo, W - Inches(1.8), alto_cuerpo)
 
         pars = cuerpo.text_frame.paragraphs
-        textos = [x.text for x in pars]
+        textos = [par.text for par in pars]
         if es_fuentes:
-            espacio, tams = 4, [18, 16, 14, 13, 12, 11, 10]
-        elif len(pars) == 1 and not pics:
-            espacio, tams = 12, [28, 26, 24, 22, 20, 18]   # texto corrido a ancho completo
-        else:
-            espacio, tams = 12, [24, 22, 20, 18, 16, 14]
-        tam = _mejor_tam(textos, cuerpo.width, cuerpo.height, tams, espacio)
-        solo_texto = len(pars) == 1 and not pics and not es_fuentes
-        _estilo(cuerpo, tam, p["texto"], anclaje=MSO_ANCHOR.MIDDLE if solo_texto else MSO_ANCHOR.TOP,
-                espacio=espacio, fuente=d["fuente_cuerpo"])
-
-        if es_fuentes:
+            tam = _mejor_tam(textos, cuerpo.width, cuerpo.height, [14, 13, 12, 11], 4, 0)
+            _estilo(cuerpo, tam, p["texto"], anclaje=MSO_ANCHOR.TOP, espacio=4, fuente=d["fuente_cuerpo"])
             for par in pars:
-                _sin_vineta(par)
                 if par.text in ENCABEZADOS_FUENTES:
                     for run in par.runs:
                         run.font.bold = True
                         run.font.size = Pt(tam + 3)
                         run.font.color.rgb = _rgb(p["acento"])
+        else:
+            tam = _mejor_tam(textos, cuerpo.width, cuerpo.height, [20, 18, 16, 15, 14, 13], 8, 0.3)
+            _estilo(cuerpo, tam, p["texto"], anclaje=MSO_ANCHOR.TOP, espacio=8, fuente=d["fuente_cuerpo"])
 
         circulo = _forma(slide, MSO_SHAPE.OVAL, W - Inches(1.1), H - Inches(0.95),
                          Inches(0.6), Inches(0.6), p["acento"], atras=False)

@@ -1,5 +1,6 @@
-"""Utilidades compartidas por todos los agentes: IA (Gemini), JSON y texto, diseño, Wikimedia Commons,
-ilustraciones con IA, funciones de python-pptx y cálculos del plan. Cada sección tiene su encabezado."""
+¿"""Utilidades compartidas por todos los agentes: IA (Gemini), JSON y texto, diseño, Wikimedia Commons,
+ilustraciones con IA, funciones de python-pptx, cálculos del plan y motor RAG ligero en memoria."""
+
 import io
 import json
 import math
@@ -25,7 +26,6 @@ from config import (CHARS_POR_DIAPOSITIVA, LIMITE_TEXTO_REVISION, MAX_DIAP_POR_T
 # Base de los agentes y errores del pipeline
 # ==============================================================================
 
-
 class Agente:
     nombre = "Agente"
     rol = ""
@@ -42,7 +42,6 @@ class ErrorPipeline(Exception):
 # ==============================================================================
 # IA (Gemini), JSON y texto
 # ==============================================================================
-
 
 def llamar_llm(system_instruction, prompt):
     """Una llamada a Gemini. 'prompt' puede ser texto o una lista (texto + imágenes).
@@ -111,13 +110,87 @@ def _referencia_en_texto(ref, texto_min):
 
 
 # ==============================================================================
-# Diseño: ¿cabe el texto en su caja? y contraste de colores
+# RAG ligero en memoria (por fragmentos y páginas)
 # ==============================================================================
 
+def _tokens_rag(texto):
+    """Palabras normalizadas de 5+ letras recortadas a su raíz de 6 caracteres."""
+    return {w[:6] for w in re.findall(r"[a-záéíóúñü0-9]{5,}", str(texto).lower())}
 
-# ---- estimación de si un texto cabe en su caja (sin renderizar) ----
+
+def crear_indice_rag(paginas_texto, texto_completo="", max_chars=900):
+    """Divide el PDF en fragmentos (chunks) con número de página y tokens para búsqueda rápida."""
+    indice = []
+    fuentes = [(i, t) for i, t in enumerate(paginas_texto or [], 1) if t and t.strip()]
+    if not fuentes and texto_completo:
+        partes = [texto_completo[i:i + max_chars] for i in range(0, len(texto_completo), max_chars)]
+        fuentes = [(i, p) for i, p in enumerate(partes, 1)]
+
+    for num_pag, txt in fuentes:
+        parrafos = [p.strip() for p in re.split(r"\n{2,}", txt.strip()) if p.strip()]
+        actual = ""
+        for p in parrafos:
+            if actual and len(actual) + len(p) + 1 > max_chars:
+                indice.append({
+                    "id": len(indice) + 1,
+                    "pagina": num_pag,
+                    "texto": actual.strip(),
+                    "tokens": list(_tokens_rag(actual)),
+                })
+                actual = ""
+            if len(p) > max_chars:
+                for k in range(0, len(p), max_chars):
+                    sub = p[k:k + max_chars].strip()
+                    if sub:
+                        indice.append({
+                            "id": len(indice) + 1,
+                            "pagina": num_pag,
+                            "texto": sub,
+                            "tokens": list(_tokens_rag(sub)),
+                        })
+            else:
+                actual = f"{actual}\n{p}".strip() if actual else p
+        if actual:
+            indice.append({
+                "id": len(indice) + 1,
+                "pagina": num_pag,
+                "texto": actual.strip(),
+                "tokens": list(_tokens_rag(actual)),
+            })
+    return indice
+
+
+def recuperar_contexto_rag(indice_rag, consulta, top_k=3):
+    """Recupera los 'top_k' fragmentos más relevantes del PDF para un tema y sus puntos."""
+    if not indice_rag:
+        return []
+    q_tokens = _tokens_rag(consulta)
+    if not q_tokens:
+        return [f"[Pág. {ch['pagina']}] {ch['texto']}" for ch in indice_rag[:top_k]]
+
+    calificados = []
+    for ch in indice_rag:
+        c_tokens = set(ch.get("tokens") or _tokens_rag(ch.get("texto", "")))
+        if not c_tokens:
+            continue
+        inter = len(q_tokens & c_tokens)
+        if inter > 0:
+            score = inter / (math.sqrt(len(q_tokens)) * math.sqrt(len(c_tokens)))
+            calificados.append((score, ch["id"], ch))
+
+    calificados.sort(key=lambda x: (-x[0], x[1]))
+    elegidos = [x[2] for x in calificados[:top_k]]
+    if not elegidos:
+        elegidos = indice_rag[:min(top_k, len(indice_rag))]
+    return [f"[Pág. {ch['pagina']}] {ch['texto']}" for ch in elegidos]
+
+
+# ==============================================================================
+# Diseño: ¿cabe el texto en su caja? y contraste de colores (con auto-ajuste)
+# ==============================================================================
+
 def _altura_in(textos, ancho_in, tam, espacio_pt, sangria_in):
-    cpl = max(1.0, (ancho_in - sangria_in) * 144 / tam / 1.1)  # caracteres por línea (aprox., conservador)
+    cpl = max(1.0, (ancho_in - sangria_in) * 144 / tam / 1.1)
     lineas = sum(max(1, math.ceil(len(t) / cpl)) for t in textos)
     return lineas * tam * 1.2 / 72 + len(textos) * espacio_pt / 72
 
@@ -139,7 +212,6 @@ def _cabe(shape, sangria_in=0.4):
     return _altura_in(textos, shape.width / 914400 - 0.2, tam, esp, sangria_in) <= shape.height / 914400 - 0.1
 
 
-# ---- color y contraste (para validar el diseño propuesto por la IA) ----
 def _hex_a_rgb(h):
     h = str(h).strip().lstrip("#")
     if not re.fullmatch(r"[0-9a-fA-F]{6}", h):
@@ -164,6 +236,65 @@ def _contraste(a, b):
     return (l1 + 0.05) / (l2 + 0.05)
 
 
+def _mezclar_rgb(color, meta, factor):
+    return tuple(max(0, min(255, int(round(c + (m - c) * factor)))) for c, m in zip(color, meta))
+
+
+def _forzar_contraste(color, referencia, minimo, hacia_oscuro):
+    """Acerca gradualmente 'color' hacia negro o blanco hasta alcanzar el contraste 'minimo'."""
+    meta = (0, 0, 0) if hacia_oscuro else (255, 255, 255)
+    actual = color
+    for paso in range(1, 26):
+        if _contraste(actual, referencia) >= minimo:
+            return actual
+        actual = _mezclar_rgb(color, meta, paso / 25.0)
+    return actual
+
+
+def ajustar_contraste_paleta(pal):
+    """Corrige suavemente los colores de la paleta propuesta por la IA si alguno tiene bajo contraste,
+    conservando su tono y evitando descartar el diseño de la IA."""
+    p = dict(pal)
+    blanco = (255, 255, 255)
+    ajustes = []
+
+    # 1. Asegurar que fondo y tinte sean claros
+    for k in ("fondo", "tinte"):
+        if _luminancia(p[k]) < 0.65:
+            nuevo = _mezclar_rgb(p[k], blanco, 0.75)
+            ajustes.append(f"{k} aclarado ({_a_hex(p[k])}→{_a_hex(nuevo)})")
+            p[k] = nuevo
+
+    # 2. Portada oscura (para texto blanco encima >= 4.5)
+    if _contraste(blanco, p["portada"]) < 4.5:
+        nuevo = _forzar_contraste(p["portada"], blanco, 4.6, hacia_oscuro=True)
+        ajustes.append(f"portada oscurecida ({_a_hex(p['portada'])}→{_a_hex(nuevo)})")
+        p["portada"] = nuevo
+
+    # 3. Acento con contraste suficiente para texto blanco (>= 3.0)
+    if _contraste(blanco, p["acento"]) < 3.0:
+        nuevo = _forzar_contraste(p["acento"], blanco, 3.1, hacia_oscuro=True)
+        ajustes.append(f"acento ajustado ({_a_hex(p['acento'])}→{_a_hex(nuevo)})")
+        p["acento"] = nuevo
+
+    # 4. Acento2 visible sobre portada (>= 3.0)
+    if _contraste(p["acento2"], p["portada"]) < 3.0:
+        nuevo = _forzar_contraste(p["acento2"], p["portada"], 3.1, hacia_oscuro=False)
+        ajustes.append(f"acento2 aclarado ({_a_hex(p['acento2'])}→{_a_hex(nuevo)})")
+        p["acento2"] = nuevo
+
+    # 5. Texto y título legibles sobre fondo y tinte (>= 4.5)
+    for k in ("texto", "titulo"):
+        for base in ("fondo", "tinte"):
+            if _contraste(p[k], p[base]) < 4.5:
+                nuevo = _forzar_contraste(p[k], p[base], 4.6, hacia_oscuro=True)
+                if nuevo != p[k]:
+                    ajustes.append(f"{k} oscurecido sobre {base} ({_a_hex(p[k])}→{_a_hex(nuevo)})")
+                    p[k] = nuevo
+
+    return p, ajustes
+
+
 def _problemas_contraste(pal):
     blanco = (0xFF, 0xFF, 0xFF)
     reglas = [("texto", pal["texto"], pal["fondo"], 4.5), ("título", pal["titulo"], pal["fondo"], 4.5),
@@ -184,7 +315,6 @@ def _problemas_contraste(pal):
 # Wikimedia Commons (imágenes con licencia libre y autor)
 # ==============================================================================
 
-
 def _licencia_libre(lic):
     return bool(re.match(r"^(cc[\s-]|cc0|public domain|pd[\s-]|pd$|gfdl)", lic.strip().lower()))
 
@@ -192,7 +322,7 @@ def _licencia_libre(lic):
 def buscar_commons(consulta, limite=8):
     """Busca imágenes en Wikimedia Commons y devuelve solo las que traen autor y licencia libre."""
     r = requests.get(
-        "https://commons.wikimedia.org/w/api.php",
+        "[https://commons.wikimedia.org/w/api.php](https://commons.wikimedia.org/w/api.php)",
         params={
             "action": "query", "generator": "search", "gsrsearch": consulta,
             "gsrnamespace": 6, "gsrlimit": limite, "prop": "imageinfo",
@@ -240,8 +370,7 @@ def descargar_imagen(url):
 # Ilustraciones generadas con IA (último recurso; Pollinations, gratis y sin clave)
 # ==============================================================================
 
-
-_URL = "https://image.pollinations.ai/prompt/"
+_URL = "[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/)"
 _ESTILO = ", flat vector illustration, simple composition, clean light background, no text, no letters, no watermark"
 _ESPERA_ENTRE_PETICIONES = 16     # segundos (el plan anónimo permite ~1 petición cada 15 s)
 _ultima = 0.0
@@ -281,7 +410,6 @@ def generar_imagen_ia(prompt, ancho=1024, alto=768, intentos=3):
 # Funciones para dibujar y escribir en diapositivas (python-pptx)
 # ==============================================================================
 
-
 def _sin_vineta(par):
     """Quita la viñeta y la sangría de un párrafo (para texto corrido)."""
     pPr = par._p.get_or_add_pPr()
@@ -302,7 +430,7 @@ def _forma(slide, tipo, x, y, w, h, color, atras=True):
     f.fill.fore_color.rgb = _rgb(color)
     f.line.fill.background()
     f.shadow.inherit = False
-    estilo = f._element.find(qn("p:style"))  # quita sombras/bordes heredados del tema
+    estilo = f._element.find(qn("p:style"))
     if estilo is not None:
         f._element.remove(estilo)
     if atras:
@@ -342,7 +470,6 @@ def _imagenes(slide):
 # Plan: temas, diapositivas e imágenes por diapositiva
 # ==============================================================================
 
-
 def rango_de_temas(paginas):
     """Cuántos temas debe sacar el Recopilador según el tamaño del PDF (20 páginas -> de 6 a 20)."""
     minimo = max(3, paginas // 3)
@@ -363,7 +490,6 @@ def presupuesto_diapositivas(secciones):
         m = min(MAX_DIAP_POR_TEMA, max(1, math.floor(chars / CHARS_POR_DIAPOSITIVA + 0.5)))
         filas.append({"numero": i, "tema": str(sec.get("tema", f"Tema {i}")), "caracteres": chars,
                       "diapositivas": m})
-    # Si se pasa del tope absoluto (sin contar introducción y conclusión), se recortan los temas más grandes
     limite = max(len(filas), MAX_DIAPOSITIVAS - 2)
     while sum(f["diapositivas"] for f in filas) > limite:
         mayor = max(filas, key=lambda f: f["diapositivas"])
@@ -391,25 +517,25 @@ def min_imagenes(n):
 
 
 def asegurar_imagenes(slides):
-    """Deja 'lleva_imagen' en cada diapositiva: al menos 60% con imagen y nunca dos seguidas sin ella.
-    Respeta las que ya estaban marcadas y solo agrega marcas. Devuelve los números de diapositiva
-    (desde 1) que tuvo que marcar."""
+    """Respeta en qué diapositivas decidió la IA poner imagen. Solo interviene si hay 3 o más
+    diapositivas seguidas sin imagen o si el total global queda por debajo del 60%."""
     n = len(slides)
     marcas = [str(sl.get("lleva_imagen")).strip().lower() in ("true", "1", "si", "sí") for sl in slides]
     cambios = []
     antes = list(marcas)
-    # 1) alternar: empezar con imagen y no dejar dos diapositivas seguidas sin ella
-    if n >= 2 and not marcas[0] and not marcas[1]:
-        marcas[0] = True
-    for i in range(1, n):
-        if not marcas[i] and not marcas[i - 1]:
-            marcas[i] = True
-    # 2) cuota mínima: marcar las que falten, repartidas a lo largo de la presentación
+
+    # 1) Evitar bloques largos sin apoyo visual (3 seguidas sin imagen -> marca la de en medio)
+    for i in range(2, n):
+        if not marcas[i] and not marcas[i - 1] and not marcas[i - 2]:
+            marcas[i - 1] = True
+
+    # 2) Cuota mínima global (60%): completar solo si la IA marcó menos del mínimo
     falta = min_imagenes(n) - sum(marcas)
     if falta > 0:
         libres = [i for i, m in enumerate(marcas) if not m]
         for j in range(min(falta, len(libres))):
             marcas[libres[int((j + 0.5) * len(libres) / falta)]] = True
+
     for i, (sl, m) in enumerate(zip(slides, marcas)):
         sl["lleva_imagen"] = m
         if m and not antes[i]:

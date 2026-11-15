@@ -1,4 +1,6 @@
-"""Agente Jefe: coordina a los demás, valida su trabajo, manda a corregir y, si hace falta, corrige él."""
+"""Agente Jefe: coordina a los demás, valida su trabajo priorizando el criterio de la IA sobre conteos rígidos,
+manda a corregir hasta 3 veces y, si hace falta, corrige él en la cuarta."""
+
 import json
 import math
 import os
@@ -23,7 +25,6 @@ from agentes.seccionador import Seccionador
 from config import (COBERTURA_MINIMA, LIMITE_TEXTO_REVISION, MAX_DIAPOSITIVAS, MAX_INTENTOS,
                     PROPORCION_IMAGENES, TITULO_FUENTES)
 
-
 SYS_JEFE = """
 Eres el Jefe supervisor de un equipo de agentes que convierte documentos en presentaciones.
 Revisas el trabajo con criterio y sin ser quisquilloso: señalas errores reales, no gustos.
@@ -40,15 +41,14 @@ class Jefe:
         self.t_inicio = time.time()
         self.texto_pdf = ""
         self.texto_original = ""
-        self.rango_temas = (3, 8)   # cuántos temas debe sacar el Recopilador (depende de las páginas)
-        self.n_temas = 0            # temas que entregó el Recopilador
+        self.rango_temas = (3, 8)
+        self.n_temas = 0
         self.secciones = []
-        self.presupuesto = []       # diapositivas que le tocan a cada tema (según sus caracteres)
-        self.objetivo = 0           # diapositivas de contenido que corresponden en total
+        self.presupuesto = []
+        self.objetivo = 0
         self.n_min, self.n_max = 3, MAX_DIAPOSITIVAS
-        self.ultimo_intento = False  # en el último intento, el veto de la IA solo avisa (para no trabar todo)
+        self.ultimo_intento = False
 
-    # ---- bitácora ----
     def _anotar(self, agente, rol, intento, estado, segundos, res=None, revisiones=None, notas=""):
         res = res or {}
         self.log.append(
@@ -68,23 +68,25 @@ class Jefe:
             }
         )
 
-    # ---- reglas de supervisión: devuelven lista de revisiones ----
     def revisar(self, nombre, s):
         c = []
         if nombre == "Lector":
             _chk(c, "Texto extraído suficiente (al menos 200 caracteres)",
                  len(s["texto"].strip()) >= 200, "Texto casi vacío (¿PDF escaneado como imagen?)")
+            _chk(c, "Índice RAG construido con fragmentos del documento",
+                 bool(s.get("indice_rag")), "No se generaron fragmentos para el índice RAG", bloquea=False)
             if s.get("solapamiento") is not None:
                 _chk(c, "La lectura de Gemini coincide con la de pdfplumber (al menos 60% de palabras)",
                      s["solapamiento"] >= 0.6,
                      f"La transcripción de Gemini solo coincide en {round(s['solapamiento'] * 100)}% con "
                      "pdfplumber; puede estar incompleta o alterada")
+
         elif nombre == "Recopilador":
             secciones = s.get("secciones", [])
             _chk(c, "Trae título y subtítulo del documento",
                  s.get("titulo_documento") and s.get("subtitulo"), "Falta 'titulo_documento' o 'subtitulo'")
-            _chk(c, "Título de máximo 12 palabras",
-                 num_palabras(s.get("titulo_documento", "")) <= 12, "El título del documento es muy largo")
+            _chk(c, "Título de máximo 14 palabras",
+                 num_palabras(s.get("titulo_documento", "")) <= 14, "El título del documento es muy largo", bloquea=False)
             _chk(c, "Trae tema general", s.get("tema_general"), "Falta 'tema_general'")
             _chk(c, "Explica su razonamiento", s.get("razonamiento"), "Falta el campo 'razonamiento'")
             mn, mx = self.rango_temas
@@ -96,13 +98,11 @@ class Jefe:
             _chk(c, "Todos los temas tienen puntos", not sin_puntos, f"Temas sin puntos: {sin_puntos}")
             refs = s.get("referencias", [])
             _chk(c, "'referencias' es una lista de máximo 8", isinstance(refs, list) and len(refs) <= 8,
-                 "'referencias' debe ser una lista de máximo 8 elementos")
-            if isinstance(refs, list):
-                inventadas = [r for r in refs if not _referencia_en_texto(str(r), self.texto_pdf)]
-                _chk(c, "Todas las referencias aparecen realmente en el PDF (anti-invención)",
-                     not inventadas,
-                     f"Estas referencias no aparecen en el documento, quítalas: {inventadas}")
-            if all(r["ok"] or not r["bloquea"] for r in c):      # la IA del Jefe revisa solo si pasó las reglas fijas
+                 "'referencias' debe ser una lista de máximo 8 elementos", bloquea=False)
+            inventadas = [r for r in refs if not _referencia_en_texto(str(r), self.texto_pdf)]
+            _chk(c, "Cada referencia aparece realmente en el texto del PDF", not inventadas,
+                 f"Referencias que no están en el PDF (posiblemente inventadas): {inventadas}")
+            if all(r["ok"] or not r["bloquea"] for r in c):
                 try:
                     r = self._revision_ia_temas(s)
                     _chk(c, "Revisión con IA: no faltan temas importantes del documento ni hay datos inventados",
@@ -118,9 +118,10 @@ class Jefe:
                 except Exception as e:
                     _chk(c, "Revisión con IA de los temas", False,
                          f"No se pudo ejecutar ({type(e).__name__}: {e})", bloquea=False)
+
         elif nombre == "Seccionador":
             c += self._checks_plan(s["slides"], s.get("razonamiento"))
-            if all(r["ok"] or not r["bloquea"] for r in c):  # la IA revisa solo si pasó las reglas fijas
+            if all(r["ok"] or not r["bloquea"] for r in c):
                 try:
                     r = self._revision_ia_plan(s)
                     _chk(c, "Revisión con IA: fiel al documento, sin ideas repetidas y coherente",
@@ -139,6 +140,7 @@ class Jefe:
                         _chk(c, "Veredicto de la IA: " + r["veredicto"], True)
                 except Exception as e:
                     _chk(c, "Revisión con IA", False, f"No se pudo ejecutar ({type(e).__name__}: {e})", bloquea=False)
+
         elif nombre == "Ilustrador":
             slides = s["slides"]
             marcadas = [i for i, x in enumerate(slides, 1) if x.get("lleva_imagen")]
@@ -151,12 +153,12 @@ class Jefe:
             _chk(c, "No planea dos imágenes para la misma diapositiva", len(en_plan) == len(set(en_plan)),
                  "Hay diapositivas repetidas en el plan de imágenes")
             malas_q = [p.get("diapositiva") for p in plan
-                       if not p.get("consulta") or num_palabras(p["consulta"]) > 6 or not p.get("prompt_ia")]
-            _chk(c, "Cada búsqueda es corta (máximo 6 palabras) y trae su descripción para la ilustración",
-                 not malas_q, f"Búsquedas o descripciones vacías o muy largas en las diapositivas {malas_q}")
+                       if not p.get("consulta") or num_palabras(p["consulta"]) > 8 or not p.get("prompt_ia")]
+            _chk(c, "Cada búsqueda es corta y trae su descripción para la ilustración",
+                 not malas_q, f"Búsquedas o descripciones vacías o muy largas en las diapositivas {malas_q}", bloquea=False)
             if marcadas:
                 _chk(c, "Explica cómo decidió qué mostrar", s.get("razonamiento_imagenes"),
-                     "Falta el razonamiento de la selección de imágenes")
+                     "Falta el razonamiento de la selección de imágenes", bloquea=False)
             _chk(c, "Colocó al menos una imagen", not marcadas or imgs,
                  "No se logró colocar ninguna imagen (fallaron las tres fuentes: PDF, web e IA)")
             n_pdf = len(s.get("imagenes_pdf", []) or [])
@@ -187,7 +189,7 @@ class Jefe:
             _chk(c, "Cada imagen trae su crédito (autor, licencia y enlace si es de la web; página si es del PDF)",
                  not sin_cred, f"Faltan datos de crédito en las diapositivas {sin_cred}")
             _chk(c, "Cada imagen trae la justificación de por qué ilustra el tema", not sin_razon,
-                 f"Falta la justificación en las diapositivas {sin_razon}")
+                 f"Falta la justificación en las diapositivas {sin_razon}", bloquea=False)
             ids = [img.get("id") or img["titulo"] for _, img in imgs]
             _chk(c, "No hay imágenes repetidas", len(ids) == len(set(ids)), "Imagen repetida")
             if imgs and all(r["ok"] or not r["bloquea"] for r in c):
@@ -199,6 +201,7 @@ class Jefe:
                 except Exception as e:
                     _chk(c, "Revisión con IA de las imágenes", False,
                          f"No se pudo ejecutar ({type(e).__name__}: {e})", bloquea=False)
+
         elif nombre == "Generador PPTX":
             existe = os.path.exists(s["ruta"])
             _chk(c, "El archivo .pptx existe", existe, "No se creó el archivo")
@@ -219,13 +222,14 @@ class Jefe:
                 _chk(c, "Cada diapositiva de contenido trae notas del orador (las escribe la IA)",
                      n_cont == 0 or n_notas >= 0.9 * n_cont,
                      f"Solo {n_notas} de {n_cont} diapositivas tienen notas del orador", bloquea=False)
+
         elif nombre == "Decorador":
             prs = Presentation(s["ruta"])
             W, H = prs.slide_width, prs.slide_height
             prob_c = _problemas_contraste(s["diseno"]["paleta"])
             _chk(c, "Los colores tienen contraste suficiente para leerse", not prob_c,
                  "Contraste bajo: " + "; ".join(prob_c))
-            _chk(c, "El diseño lo propuso la IA (si no, se usó el diseño de respaldo)",
+            _chk(c, "El diseño lo propuso la IA (con auto-ajuste de contraste si hacía falta)",
                  s.get("origen_diseno") == "IA",
                  "Se usó el diseño de respaldo: " + "; ".join(s.get("problemas_ia", [])), bloquea=False)
             _chk(c, "No cambió el número de diapositivas", len(prs.slides) == s["n_slides"],
@@ -236,9 +240,11 @@ class Jefe:
             sin_formas = [i for i, sl in enumerate(prs.slides, 1) if len(sl.shapes) <= len(sl.placeholders)]
             _chk(c, "Todas las diapositivas tienen elementos decorativos", not sin_formas,
                  f"Sin decoración en las diapositivas: {sin_formas}")
+
             def se_cruzan(a, b):
                 return (a.left < b.left + b.width and b.left < a.left + a.width
                         and a.top < b.top + b.height and b.top < a.top + a.height)
+
             fuera, solapa = [], []
             for i, sl in enumerate(prs.slides, 1):
                 for pic in _imagenes(sl):
@@ -271,35 +277,48 @@ class Jefe:
              f"Hay {n} diapositivas; el máximo es {MAX_DIAPOSITIVAS}")
         _chk(c, f"No se pasa del máximo recomendado ({self.n_max})", n <= self.n_max,
              f"Hay {n} diapositivas y el objetivo era {self.objetivo}", bloquea=False)
-        malos = [i for i, sl in enumerate(slides, 1) if not sl.get("title") or num_palabras(sl["title"]) > 8]
-        _chk(c, "Títulos de máximo 8 palabras", not malos,
-             f"Títulos vacíos o de más de 8 palabras en las diapositivas {malos}")
+
+        sin_titulo = [i for i, sl in enumerate(slides, 1) if not str(sl.get("title", "")).strip()]
+        _chk(c, "Todas las diapositivas tienen título", not sin_titulo,
+             f"Falta el título en las diapositivas {sin_titulo}")
+
+        titulos_largos = [i for i, sl in enumerate(slides, 1) if num_palabras(sl.get("title", "")) > 12]
+        _chk(c, "Títulos concisos (recomendado máximo 12 palabras)", not titulos_largos,
+             f"Títulos de más de 12 palabras en las diapositivas {titulos_largos}", bloquea=False)
 
         tipos_mal = [i for i, sl in enumerate(slides, 1) if sl.get("tipo") not in ("parrafo", "mixto", "bullets")]
         _chk(c, "Cada diapositiva tiene un 'tipo' válido (parrafo, mixto o bullets)", not tipos_mal,
              f"'tipo' inválido o ausente en las diapositivas {tipos_mal}")
 
-        incoherentes = []
+        vacias, avisos_ext = [], []
         for i, sl in enumerate(slides, 1):
-            t, par, bl = sl.get("tipo"), sl.get("parrafo", "") or "", sl.get("bullets", []) or []
-            if t == "parrafo" and not 25 <= num_palabras(par) <= 55:
-                incoherentes.append(f"{i} (párrafo de {num_palabras(par)} palabras; debe tener 25 a 55)")
-            elif t == "mixto" and not (10 <= num_palabras(par) <= 30 and 2 <= len(bl) <= 5):
-                incoherentes.append(f"{i} (mixto: párrafo de 10 a 30 palabras y 2 a 5 bullets)")
-            elif t == "bullets" and not 3 <= len(bl) <= 8:
-                incoherentes.append(f"{i} (bullets: debe tener 3 a 8)")
-        _chk(c, "El contenido de cada diapositiva coincide con su tipo y sus límites", not incoherentes,
-             "Revisa las diapositivas: " + "; ".join(incoherentes))
+            t, par, bl = sl.get("tipo"), (sl.get("parrafo") or "").strip(), sl.get("bullets") or []
+            np = num_palabras(par)
+            if not par and not bl:
+                vacias.append(i)
+            elif t == "parrafo" and not 15 <= np <= 85:
+                avisos_ext.append(f"{i} (párrafo de {np} palabras; recomendado 15 a 85)")
+            elif t == "mixto" and not (8 <= np <= 50 and 1 <= len(bl) <= 6):
+                avisos_ext.append(f"{i} (mixto: {np} palabras y {len(bl)} bullets)")
+            elif t == "bullets" and not 2 <= len(bl) <= 8:
+                avisos_ext.append(f"{i} (bullets: tiene {len(bl)}, recomendado 2 a 8)")
+
+        _chk(c, "Ninguna diapositiva está vacía de contenido", not vacias,
+             f"Diapositivas sin texto ni bullets: {vacias}")
+        _chk(c, "Extensión de párrafos y viñetas dentro del rango flexible (guía visual, no bloquea)",
+             not avisos_ext, "Aviso de extensión en diapositivas: " + "; ".join(avisos_ext), bloquea=False)
 
         solo_bullets = sum(1 for sl in slides if sl.get("tipo") == "bullets")
-        permitido = math.ceil(0.6 * n)
-        _chk(c, "No más del 60% de las diapositivas son solo bullets", solo_bullets <= permitido,
-             f"{solo_bullets} de {n} diapositivas son solo bullets (máximo {permitido}); usa más texto corrido")
+        permitido = math.ceil(0.65 * n)
+        _chk(c, "Predominio de texto corrido y mixto (no más del 65% solo bullets)", solo_bullets <= permitido,
+             f"{solo_bullets} de {n} diapositivas son solo bullets (máximo recomendado {permitido})",
+             bloquea=False)
 
         largos = [i for i, sl in enumerate(slides, 1)
-                  if any(num_palabras(b) > 15 for b in (sl.get("bullets") or []))]
-        _chk(c, "Bullets de máximo 15 palabras", not largos,
-             f"Bullets de más de 15 palabras en las diapositivas {largos}")
+                  if any(num_palabras(b) > 22 for b in (sl.get("bullets") or []))]
+        _chk(c, "Bullets concisos (recomendado máximo 22 palabras)", not largos,
+             f"Bullets de más de 22 palabras en las diapositivas {largos}", bloquea=False)
+
         vistos, repetidos = set(), []
         for i, sl in enumerate(slides, 1):
             for b in (sl.get("bullets") or []):
@@ -307,40 +326,39 @@ class Jefe:
                 if clave in vistos:
                     repetidos.append(i)
                 vistos.add(clave)
-        _chk(c, "Sin bullets repetidos", not repetidos,
-             f"Bullets repetidos en las diapositivas {sorted(set(repetidos))}")
+        _chk(c, "Sin bullets idénticos repetidos", not repetidos,
+             f"Bullets repetidos en las diapositivas {sorted(set(repetidos))}", bloquea=False)
 
         def temas_validos(sl):
             t = sl.get("temas")
             return (isinstance(t, list) and t
                     and all(isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= self.n_temas for x in t))
+
         temas_mal = [i for i, sl in enumerate(slides, 1) if not temas_validos(sl)]
         _chk(c, "Cada diapositiva indica qué temas del Recopilador cubre (números válidos)", not temas_mal,
              f"Falta 'temas' o tiene números inválidos (1 a {self.n_temas}) en las diapositivas {temas_mal}")
-        # La introducción y la conclusión resumen varios temas: la cobertura se mide con las de en medio
+
         medio = slides[1:-1] if n >= 3 else slides
         cubiertos = {x for sl in medio if temas_validos(sl) for x in sl["temas"]}
         minimo_cub = math.ceil(round(COBERTURA_MINIMA * self.n_temas, 6))
         faltan = sorted(set(range(1, self.n_temas + 1)) - cubiertos)
         _chk(c, f"Cobertura: al menos el {round(COBERTURA_MINIMA * 100)}% de los temas del Recopilador tiene "
-                f"su propia diapositiva ({minimo_cub} de {self.n_temas})",
+             f"su propia diapositiva ({minimo_cub} de {self.n_temas})",
              len(cubiertos) >= minimo_cub,
              "Ninguna diapositiva desarrolla los temas " + ", ".join(
                  f"{k} ({self.secciones[k - 1].get('tema', '?')})" for k in faltan))
 
-        # Imágenes: el Seccionador es quien dice en qué diapositivas va una
         marcadas = [bool(sl.get("lleva_imagen")) for sl in slides]
         minimo_img = min_imagenes(n)
         _chk(c, f"Al menos el {round(PROPORCION_IMAGENES * 100)}% de las diapositivas llevan imagen "
-                f"({minimo_img} de {n})", sum(marcadas) >= minimo_img,
+             f"({minimo_img} de {n})", sum(marcadas) >= minimo_img,
              f"Solo {sum(marcadas)} de {n} diapositivas llevan imagen; deben ser al menos {minimo_img}")
-        seguidas = [i + 1 for i in range(1, n) if not marcadas[i] and not marcadas[i - 1]]
-        _chk(c, "Las imágenes están repartidas (nunca dos diapositivas seguidas sin imagen)", not seguidas,
-             f"Hay dos diapositivas seguidas sin imagen que terminan en la {seguidas}")
+        tres_seguidas = [i + 1 for i in range(2, n) if not marcadas[i] and not marcadas[i - 1] and not marcadas[i - 2]]
+        _chk(c, "Buena distribución visual (máximo dos diapositivas seguidas sin imagen)", not tres_seguidas,
+             f"Hay tres o más diapositivas seguidas sin imagen hacia la {tres_seguidas}", bloquea=False)
         _chk(c, "Explica su razonamiento", razonamiento, "Falta el campo 'razonamiento'")
         return c
 
-    # ---- revisiones con IA del Jefe ----
     def _revision_ia_plan(self, salida):
         plan = [{"numero": i, **{k: sl.get(k) for k in ("title", "tipo", "parrafo", "bullets")}}
                 for i, sl in enumerate(salida["slides"], 1)]
@@ -359,7 +377,7 @@ class Jefe:
             "(aunque el plan diga cubrirlos). Si todos están tratados, deja la lista vacía.\n"
             "Pon en 'problemas_graves' SOLO lo que sea claramente un error (afirmación inventada, "
             "contradicción, idea repetida, diapositiva fuera de tema), indicando el número de diapositiva. "
-            "Los asuntos de estilo o mejoras opcionales van en 'sugerencias'. Si no hay problemas graves, "
+            "Los asuntos de estilo o conteo de palabras van en 'sugerencias'. Si no hay problemas graves, "
             "deja la lista vacía.\n"
             'Responde {"problemas_graves": ["diapositiva N: ..."], "sugerencias": ["..."], '
             '"temas_sin_cubrir": [N], "veredicto": "<una frase>"}\n\n'
@@ -394,7 +412,7 @@ class Jefe:
                 "datos_inventados": lista("datos_inventados")}
 
     def _revision_ia_imagenes(self, slides, imgs):
-        """La IA del Jefe VE cada imagen junto al texto de su diapositiva y dice si encaja. Devuelve [(diapositiva, motivo)]."""
+        """La IA del Jefe VE cada imagen junto al texto de su diapositiva y dice si encaja."""
         rechazadas = []
         for ini in range(0, len(imgs), 4):
             lote = imgs[ini:ini + 4]
@@ -425,11 +443,9 @@ class Jefe:
             "Problemas que señaló el Jefe:\n" + str(problemas) + "\n\n"
             f"Reglas: entre {self.n_min} y {self.n_max} diapositivas; cada tema del RESUMEN tiene su propia "
             "diapositiva (su número en 'temas'), salvo la introducción (primera) y la conclusión (última); "
-            "'tipo' es parrafo (25 a 55 palabras, sin bullets), mixto (párrafo de 10 a 30 palabras y 2 a 5 bullets) "
-            "o bullets (3 a 8 bullets de máximo 15 palabras); títulos de máximo 8 palabras; no más del 60% solo "
-            "bullets; al menos el 60% con 'lleva_imagen' true y nunca dos seguidas sin imagen; usa solo información "
+            "'tipo' es parrafo, mixto o bullets; al menos el 60% con 'lleva_imagen' true; usa solo información "
             "del RESUMEN.\n"
-            'Responde {"razonamiento": "...", "slides": [<TODAS las diapositivas corregidas>]}\n\n'
+            'Responde {"razonamiento": "...", "slides": [<TODAS corregidas diapositivas las>]}\n\n'
             "RESUMEN DE TEMAS:\n" + json.dumps(temas, ensure_ascii=False) + "\n\nPLAN ACTUAL:\n"
             + json.dumps(plan, ensure_ascii=False)
         )
@@ -473,23 +489,22 @@ class Jefe:
                          {"recibio": "-", "entrego": "-",
                           "razonamiento": f"No se pudo ejecutar la revisión con IA: {type(e).__name__}: {e}"})
 
-    # ---- corrección directa del Jefe (cuando el agente ya no puede) ----
     def _corregir_plan(self, salida):
         cambios, vistos, nuevos = [], set(), []
         slides = salida["slides"]
         if len(slides) > MAX_DIAPOSITIVAS:
             cambios.append(f"recortó el plan a {MAX_DIAPOSITIVAS} diapositivas")
         for i, sl in enumerate(slides[:MAX_DIAPOSITIVAS], 1):
-            t = " ".join(str(sl.get("title", "Sin título")).split()[:8])
+            t = " ".join(str(sl.get("title", "Sin título")).split()[:12])
             par = (sl.get("parrafo") or "").strip()
-            if num_palabras(par) > 55:
-                par = " ".join(par.split()[:55]) + "…"
+            if num_palabras(par) > 85:
+                par = " ".join(par.split()[:85]) + "…"
                 cambios.append(f"recortó el párrafo de la diapositiva {i}")
             bullets = []
             for b in (sl.get("bullets") or []):
                 palabras = str(b).split()
-                if len(palabras) > 15:
-                    b = " ".join(palabras[:15]) + "…"
+                if len(palabras) > 22:
+                    b = " ".join(palabras[:22]) + "…"
                     cambios.append(f"recortó un bullet de la diapositiva {i}")
                 clave = b.strip().lower()
                 if clave in vistos:
@@ -508,35 +523,27 @@ class Jefe:
             nuevos.append({"title": t, "tipo": tipo, "parrafo": par, "bullets": bullets, "temas": temas,
                            "lleva_imagen": bool(sl.get("lleva_imagen"))})
 
-        # Cobertura: por cada tema que nadie desarrolla, el Jefe agrega una diapositiva con los puntos del Recopilador
-        def cubiertos_de(lista):
-            medio = lista[1:-1] if len(lista) >= 3 else lista
-            return {x for sl in medio for x in sl["temas"]}
-        cubiertos = cubiertos_de(nuevos)
+        medio = nuevos[1:-1] if len(nuevos) >= 3 else nuevos
+        cubiertos = {x for sl in medio for x in sl["temas"]}
         for k in range(1, self.n_temas + 1):
-            if k in cubiertos or len(nuevos) >= MAX_DIAPOSITIVAS:
-                continue
-            sec = self.secciones[k - 1]
-            puntos = []
-            for pt in (sec.get("puntos") or [])[:8]:
-                palabras = str(pt).split()
-                puntos.append(" ".join(palabras[:15]) + ("…" if len(palabras) > 15 else ""))
-            nueva = {"title": " ".join(str(sec.get("tema", f"Tema {k}")).split()[:8]), "tipo": "bullets",
-                     "parrafo": "", "bullets": puntos, "temas": [k], "lleva_imagen": False}
-            nuevos.insert(max(0, len(nuevos) - 1), nueva)   # antes de la conclusión
-            cubiertos.add(k)
-            cambios.append(f"agregó una diapositiva para el tema {k} («{sec.get('tema', '?')}») que nadie desarrollaba")
+            if k not in cubiertos and len(nuevos) < MAX_DIAPOSITIVAS:
+                sec = self.secciones[k - 1]
+                puntos = [" ".join(str(p).split()[:20]) for p in (sec.get("puntos") or [])[:5]]
+                nueva = {"title": " ".join(str(sec.get("tema", f"Tema {k}")).split()[:10]), "tipo": "bullets",
+                         "parrafo": "", "bullets": puntos, "temas": [k], "lleva_imagen": False}
+                nuevos.insert(max(0, len(nuevos) - 1), nueva)
+                cubiertos.add(k)
+                cambios.append(f"agregó una diapositiva para el tema {k} («{sec.get('tema', '?')}») que nadie desarrollaba")
 
         marcadas = asegurar_imagenes(nuevos)
         if marcadas:
             cambios.append(f"marcó con imagen las diapositivas {marcadas} para llegar al "
-                           f"{round(PROPORCION_IMAGENES * 100)}% y no dejar dos seguidas sin imagen")
+                           f"{round(PROPORCION_IMAGENES * 100)}%")
         razon = salida.get("razonamiento")
         if not razon:
             cambios.append("completó el razonamiento faltante")
         return {**salida, "slides": nuevos, "razonamiento": razon or "(el agente no explicó su decisión)"}, cambios
 
-    # ---- ciclo de supervisión de un agente ----
     def _supervisar(self, agente, entrada, opcional=False, respaldo=None):
         feedback, res = None, None
         for intento in range(1, MAX_INTENTOS + 1):
@@ -550,22 +557,19 @@ class Jefe:
                 _chk(revisiones, "La ejecución termina sin errores", False, f"{type(e).__name__}: {e}")
             dt = time.time() - t0
             problemas = [r["detalle"] for r in revisiones if not r["ok"] and r["bloquea"]]
-
             if not problemas:
                 self._anotar(agente.nombre, agente.rol, intento, "✅ Aprobado", dt, res, revisiones)
                 return res["salida"]
-
             self._anotar(agente.nombre, agente.rol, intento, "❌ Rechazado por el Jefe", dt, res, revisiones,
                          notas="Motivos: " + "; ".join(problemas))
             feedback = "- " + "\n- ".join(problemas)
 
-        # Se acabaron los intentos: el Jefe interviene si puede
         if agente.nombre == "Seccionador" and res:
             salida_ia, por_ia = res["salida"], False
             try:
                 salida_ia, por_ia = self._corregir_plan_ia(res["salida"], feedback), True
             except Exception:
-                pass                                      # si la IA no puede, el código corrige solo
+                pass
             nuevo, cambios = self._corregir_plan(salida_ia)
             if por_ia:
                 cambios.insert(0, "la IA rehízo el plan con las objeciones del Jefe")
@@ -603,7 +607,6 @@ class Jefe:
                      notas=feedback or "")
         raise ErrorPipeline(f"{agente.nombre} no logró entregar un resultado válido")
 
-    # ---- cuántas diapositivas le tocan a cada tema ----
     def _calcular_presupuesto(self):
         self.presupuesto = presupuesto_diapositivas(self.secciones)
         self.objetivo = total_objetivo(self.presupuesto)
@@ -621,13 +624,13 @@ class Jefe:
                                       "de los límites.",
                       "detalle": "\n".join(detalle)})
 
-    # ---- el flujo completo ----
     def coordinar(self, pdf_path, ruta_pptx, carpeta):
         lectura = self._supervisar(Lector(carpeta), pdf_path)
         self.texto_original = lectura["texto"]
         self.rango_temas = rango_de_temas(max(1, int(lectura.get("paginas", 1))))
         self.texto_pdf = (lectura["texto"] + "\n" + lectura.get("texto_plumber", "")).lower()
         resumen = self._supervisar(Recopilador(self.rango_temas), lectura)
+        resumen["indice_rag"] = lectura.get("indice_rag", [])
         self.secciones = resumen.get("secciones", [])
         self.n_temas = len(self.secciones)
         self._calcular_presupuesto()
@@ -641,7 +644,6 @@ class Jefe:
         self._revision_final(final["ruta"])
         return final["ruta"]
 
-    # ---- reporte para ti (el "jefe de jefes") ----
     def reporte_html(self, exito):
         e = escape
         rechazos = sum(1 for x in self.log if "Rechazado" in x["estado"])
@@ -650,7 +652,6 @@ class Jefe:
         total = round(time.time() - self.t_inicio, 1)
         caja = "border:1px solid rgba(128,128,128,.4);border-radius:8px;margin:8px 0;padding:8px 12px;"
         celda = "border:1px solid rgba(128,128,128,.35);padding:6px 8px;text-align:left;"
-
         h = ['<div style="max-height:75vh;overflow-y:auto;padding-right:10px;">']
         h.append("<h3>Informe final del Jefe</h3><ul>")
         h.append(f"<li>Resultado: {'✅ presentación generada' if exito else '🛑 el proceso se detuvo'}</li>")
@@ -658,19 +659,16 @@ class Jefe:
         h.append(f"<li>Correcciones hechas por el Jefe: {correcciones}</li>")
         h.append(f"<li>Pasos opcionales omitidos: {omitidos}</li>")
         h.append(f"<li>Tiempo total: {total} s</li></ul>")
-
         h.append("<h3>Resumen de la corrida</h3>")
         h.append('<table style="border-collapse:collapse;width:100%;"><tr>'
-                 + "".join(f'<th style="{celda}">{t}</th>' for t in ["#", "Agente", "Intento", "Estado", "Seg"])
+                 + "".join(f'<th style="{celda}">{c}</th>'
+                           for c in ("#", "Agente", "Intento", "Estado", "Entregó", "Tiempo"))
                  + "</tr>")
         for x in self.log:
-            h.append("<tr>" + "".join(
-                f'<td style="{celda}">{e(str(v))}</td>'
-                for v in [x["paso"], x["agente"], x["intento"], x["estado"], x["segundos"]]
-            ) + "</tr>")
-        h.append("</table>")
-
-        h.append("<h3>Detalle por agente (clic para abrir)</h3>")
+            h.append("<tr>" + "".join(f'<td style="{celda}">{v}</td>' for v in (
+                x["paso"], e(x["agente"]), e(str(x["intento"])), e(x["estado"]),
+                e(x["entrego"]), f'{x["segundos"]} s')) + "</tr>")
+        h.append("</table><h3>Bitácora detallada paso a paso</h3>")
         for x in self.log:
             abierto = " open" if any(k in x["estado"] for k in ("Rechazado", "Corrigió", "Detuvo", "Siguió", "Revisión final")) else ""
             h.append(f'<details{abierto} style="{caja}"><summary style="cursor:pointer;font-weight:600;">'
@@ -688,12 +686,12 @@ class Jefe:
                          f'<pre style="white-space:pre-wrap;margin:0;padding:8px;'
                          f'border:1px solid rgba(128,128,128,.35);border-radius:6px;">{e(x["detalle"])}</pre>')
             if x["revisiones"]:
-                h.append("<p><b>Revisiones del Jefe:</b></p><ul>")
+                h.append("<p><b>Revisión del Jefe:</b></p><ul>")
                 for r in x["revisiones"]:
-                    marca = "✅" if r["ok"] else ("❌" if r["bloquea"] else "⚠️")
-                    extra = f" — {e(r['detalle'])}" if not r["ok"] else ""
-                    h.append(f"<li>{marca} {e(r['regla'])}{extra}</li>")
+                    icono = "✔️" if r["ok"] else ("❌" if r["bloquea"] else "⚠️")
+                    extra = "" if r["ok"] else f" — {e(r['detalle'])}"
+                    h.append(f"<li>{icono} {e(r['regla'])}{extra}</li>")
                 h.append("</ul>")
             h.append("</details>")
         h.append("</div>")
-        return "".join(h)
+        return "\n".join(h)

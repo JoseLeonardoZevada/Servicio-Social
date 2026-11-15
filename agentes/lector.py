@@ -1,12 +1,12 @@
 """Agente Lector: lee el PDF con Gemini (respaldo: pdfplumber) y saca las imágenes que trae el PDF."""
+
 import os
 import re
 
 import pdfplumber
 from PIL import ImageStat
 
-from utils import Agente, llamar_llm, parsear_json
-
+from utils import Agente, crear_indice_rag, llamar_llm, parsear_json
 
 SYS_LECTOR = """
 Eres un transcriptor de documentos. Copias el texto de un PDF de forma fiel, en orden,
@@ -127,7 +127,7 @@ def _solapamiento(a, b):
 
 class Lector(Agente):
     nombre = "Lector"
-    rol = "Lee el PDF con Gemini (también escaneados) y usa pdfplumber como respaldo"
+    rol = "Lee el PDF con Gemini (también escaneados), usa pdfplumber como respaldo e indexa fragmentos para RAG"
 
     def __init__(self, carpeta):
         self.carpeta = carpeta
@@ -149,8 +149,8 @@ class Lector(Agente):
         imagenes = self._imagenes
         t_plumber = "\n".join(t for t in paginas if t)
         vacias = sum(1 for t in paginas if not t)
-
         fuente, t_ia, nota = "pdfplumber", "", ""
+
         if feedback:
             nota = "El Jefe rechazó la lectura anterior, así que usé el respaldo (pdfplumber)."
         else:
@@ -160,7 +160,7 @@ class Lector(Agente):
                 with open(entrada, "rb") as f:
                     datos = f.read()
                 t_ia = llamar_llm(SYS_LECTOR, ["Transcribe todo el texto de este PDF.",
-                                                {"mime_type": "application/pdf", "data": datos}])
+                                               {"mime_type": "application/pdf", "data": datos}])
                 fuente = "Gemini"
             except Exception as e:
                 nota = f"Gemini no pudo leer el PDF ({type(e).__name__}: {e}); usé pdfplumber."
@@ -170,11 +170,14 @@ class Lector(Agente):
         if fuente == "Gemini" and len(t_plumber.strip()) >= 200:
             solap = _solapamiento(t_plumber, t_ia)
 
+        indice_rag = crear_indice_rag(paginas, texto)
+
         lineas = [f"Fuente usada: {fuente}"]
         if nota:
             lineas.append(nota)
         if solap is not None:
             lineas.append(f"Coincidencia de palabras con pdfplumber: {round(solap * 100)}%")
+        lineas.append(f"Índice RAG creado en memoria: {len(indice_rag)} fragmentos por página listos para consulta.")
         if fuente == "Gemini":
             lineas.append(f"Inicio de la transcripción: {t_ia[:400].strip()!r}...")
         lineas.append("")
@@ -195,13 +198,14 @@ class Lector(Agente):
 
         return {
             "salida": {"texto": texto, "paginas": len(paginas), "fuente": fuente,
-                       "texto_plumber": t_plumber, "solapamiento": solap, "imagenes_pdf": imagenes},
+                       "texto_plumber": t_plumber, "solapamiento": solap, "imagenes_pdf": imagenes,
+                       "indice_rag": indice_rag},
             "recibio": f"PDF: {os.path.basename(entrada)}",
-            "entrego": (f"{len(paginas)} páginas, {len(texto)} caracteres de texto (leído con {fuente}) "
-                        f"y {len(imagenes)} imágenes del PDF"),
+            "entrego": (f"{len(paginas)} páginas, {len(texto)} caracteres de texto (leído con {fuente}), "
+                        f"{len(indice_rag)} fragmentos RAG y {len(imagenes)} imágenes del PDF"),
             "razonamiento": (
-                "Leí el PDF con pdfplumber (respaldo) y se lo mandé a Gemini para una transcripción más "
-                "completa, que sirve también con PDFs escaneados o con tablas. "
+                "Leí el PDF con pdfplumber (respaldo), lo envié a Gemini para transcripción completa "
+                f"y construí un índice RAG de {len(indice_rag)} fragmentos para recuperar información precisa por tema. "
                 + (nota or "Usé la transcripción de Gemini porque coincide con la lectura de pdfplumber.")
             ),
             "detalle": "\n".join(lineas),
